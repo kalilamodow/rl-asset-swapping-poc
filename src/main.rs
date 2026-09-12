@@ -265,15 +265,101 @@ fn decrypt(buffer: &mut [u8]) {
     }
 }
 
+#[derive(Debug)]
+struct FNameRef {
+    name_index: i32,
+    instance_number: i32,
+}
+
+impl Deserializable for FNameRef {
+    fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
+        Ok(Self {
+            name_index: reader.read_i32::<LittleEndian>()?,
+            instance_number: reader.read_i32::<LittleEndian>()?,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct FImportEntry {
+    class_package: FNameRef,
+    class_name: FNameRef,
+    outer_index: i32,
+    object_name: FNameRef,
+}
+
+impl Deserializable for FImportEntry {
+    fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
+        Ok(Self {
+            class_package: FNameRef::deserialize(reader)?,
+            class_name: FNameRef::deserialize(reader)?,
+            outer_index: reader.read_i32::<LittleEndian>()?,
+            object_name: FNameRef::deserialize(reader)?,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct FNameEntry {
+    name: FString,
+    flags: u64,
+}
+
+impl Deserializable for FNameEntry {
+    fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
+        Ok(Self {
+            name: FString::deserialize(reader)?,
+            flags: reader.read_u64::<LittleEndian>()?,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct FExportEntry {
+    class_index: i32,
+    super_index: i32,
+    outer_index: i32,
+    object_name: FNameRef,
+    archetype_index: i32,
+    object_flags: u64,
+    serial_size: i32,
+    serial_offset: i64,
+    export_flags: i32,
+    net_objects: TArray<i32>,
+    package_guid: FGuid,
+    package_flags: i32,
+}
+
+impl Deserializable for FExportEntry {
+    fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
+        Ok(Self {
+            class_index: reader.read_i32::<LittleEndian>()?,
+            super_index: reader.read_i32::<LittleEndian>()?,
+            outer_index: reader.read_i32::<LittleEndian>()?,
+            object_name: FNameRef::deserialize(reader)?,
+            archetype_index: reader.read_i32::<LittleEndian>()?,
+            object_flags: reader.read_u64::<LittleEndian>()?,
+            serial_size: reader.read_i32::<LittleEndian>()?,
+            serial_offset: reader.read_i64::<LittleEndian>()?,
+            export_flags: reader.read_i32::<LittleEndian>()?,
+            net_objects: TArray::deserialize(reader)?,
+            package_guid: FGuid::deserialize(reader)?,
+            package_flags: reader.read_i32::<LittleEndian>()?,
+        })
+    }
+}
+
+#[derive(Debug)]
 struct Upk {
     summary: FPackageFileSummary,
-    data: Vec<u8>,
+    names: Vec<FNameEntry>,
+    imports: Vec<FImportEntry>,
+    exports: Vec<FExportEntry>,
 }
 
 impl Upk {
     fn new(mut reader: impl Read + Seek) -> AnyResult<Self> {
         let summary = FPackageFileSummary::deserialize(&mut reader)?;
-        println!("{summary:#?}");
         if summary.tag == PACKAGE_FILE_TAG {
             println!("package tag is correct :)");
         } else {
@@ -285,20 +371,52 @@ impl Upk {
             summary.total_header_size - summary.garbage_size - summary.name_offset;
         let encrypted_size = (actual_encrypted_size + 15) & !15; // roudns up to nearest aes block
         reader.seek(io::SeekFrom::Start(summary.name_offset as u64))?;
-        let mut decrypted_data = vec![0u8; encrypted_size as usize];
+        let mut package = vec![0u8; encrypted_size as usize];
 
-        reader.read_exact(&mut decrypted_data)?;
-        decrypt(&mut decrypted_data);
+        reader.read_exact(&mut package)?;
+        decrypt(&mut package);
+
+        let mut reader = Cursor::new(package);
+
+        // after this point, the summary offsets are wrong because the reader's ZERO is
+        // actually summary.name_offset. so, we have to subtract summary.name_offset for stuff
+
+        let mut names = Vec::with_capacity(summary.name_count as usize);
+        for _ in 0..summary.name_count {
+            let entry = FNameEntry::deserialize(&mut reader)?;
+            names.push(entry);
+        }
+
+        reader.seek(io::SeekFrom::Start(
+            (summary.import_offset - summary.name_offset) as u64,
+        ))?;
+        let mut imports = Vec::with_capacity(summary.import_count as usize);
+        for _ in 0..summary.import_count {
+            let entry = FImportEntry::deserialize(&mut reader)?;
+            imports.push(entry);
+        }
+
+        reader.seek(io::SeekFrom::Start(
+            (summary.export_offset - summary.name_offset) as u64,
+        ))?;
+        let mut exports = Vec::with_capacity(summary.export_count as usize);
+        for _ in 0..summary.export_count {
+            let entry = FExportEntry::deserialize(&mut reader)?;
+            exports.push(entry);
+        }
 
         Ok(Self {
             summary,
-            data: decrypted_data,
+            names,
+            imports,
+            exports,
         })
     }
 }
 
 fn main() -> AnyResult<()> {
-    let bubble = Upk::new(fs::File::open("Boost_Bubble_SF.upk")?)?;
+    let upk = Upk::new(fs::File::open("body_grain_SF.upk")?)?;
+    println!("{:#?}", upk.names);
 
     Ok(())
 }
