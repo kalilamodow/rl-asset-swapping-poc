@@ -1,4 +1,6 @@
+use aes::Aes256;
 use byteorder::{LittleEndian, ReadBytesExt};
+use cipher::{BlockCipherDecrypt, KeyInit as _};
 use std::{
     fs,
     io::{self, Cursor, Read, Seek},
@@ -250,19 +252,53 @@ impl Deserializable for FPackageFileSummary {
     }
 }
 
+const AES_KEY: [u8; 32] = [
+    0xC7, 0xDF, 0x6B, 0x13, 0x25, 0x2A, 0xCC, 0x71, 0x47, 0xBB, 0x51, 0xC9, 0x8A, 0xD7, 0xE3, 0x4B,
+    0x7F, 0xE5, 0x00, 0xB7, 0x7F, 0xA5, 0xFA, 0xB2, 0x93, 0xE2, 0xF2, 0x4E, 0x6B, 0x17, 0xE7, 0x79,
+];
+
+// note: in-place
+fn decrypt(buffer: &mut [u8]) {
+    let cipher = Aes256::new((&AES_KEY).into());
+    for chunk in buffer.chunks_exact_mut(16) {
+        cipher.decrypt_block(chunk.try_into().unwrap());
+    }
+}
+
+struct Upk {
+    summary: FPackageFileSummary,
+    data: Vec<u8>,
+}
+
+impl Upk {
+    fn new(mut reader: impl Read + Seek) -> AnyResult<Self> {
+        let summary = FPackageFileSummary::deserialize(&mut reader)?;
+        println!("{summary:#?}");
+        if summary.tag == PACKAGE_FILE_TAG {
+            println!("package tag is correct :)");
+        } else {
+            println!("package tag is incorrect :( (got {})", summary.tag);
+            return Err("Package tag is incorrect".into());
+        }
+
+        let actual_encrypted_size =
+            summary.total_header_size - summary.garbage_size - summary.name_offset;
+        let encrypted_size = (actual_encrypted_size + 15) & !15; // roudns up to nearest aes block
+        reader.seek(io::SeekFrom::Start(summary.name_offset as u64))?;
+        let mut decrypted_data = vec![0u8; encrypted_size as usize];
+
+        reader.read_exact(&mut decrypted_data)?;
+        decrypt(&mut decrypted_data);
+
+        Ok(Self {
+            summary,
+            data: decrypted_data,
+        })
+    }
+}
+
 fn main() -> AnyResult<()> {
-    let mut file = fs::File::open("WHEEL_Atlantis_SF.upk")?;
-    println!("opened the file");
-
-    let summary = FPackageFileSummary::deserialize(&mut file)?;
-    if summary.tag == PACKAGE_FILE_TAG {
-        println!("package tag is correct :)");
-    }
-    if file.stream_position()? == summary.name_offset as u64 {
-        println!("name offset is correct :)");
-    }
-
-    println!("{summary:#?}");
+    let bubble = Upk::new(fs::File::open("Boost_Bubble_SF.upk")?)?;
 
     Ok(())
 }
