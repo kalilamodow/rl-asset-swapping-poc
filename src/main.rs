@@ -1,9 +1,9 @@
 use aes::Aes256;
-use byteorder::{LittleEndian, ReadBytesExt};
-use cipher::{BlockCipherDecrypt, KeyInit as _};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt as _};
+use cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit as _};
 use std::{
     fs,
-    io::{self, Cursor, Read, Seek},
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
 };
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -11,7 +11,7 @@ type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 trait ReadBytes: Read {
     fn read_bytes(&mut self, n_bytes: usize) -> io::Result<Vec<u8>> {
         let mut buffer = vec![0u8; n_bytes];
-        self.read_exact(&mut buffer)?;
+        self.read_exact(&mut buffer).unwrap();
         Ok(buffer)
     }
 
@@ -23,7 +23,8 @@ trait ReadBytes: Read {
 
 impl<T: Read + ?Sized> ReadBytes for T {}
 
-trait Deserializable: Sized {
+trait UPKPart: Sized {
+    fn serialize(&self, writer: &mut impl Write) -> AnyResult<()>;
     fn deserialize(reader: &mut impl Read) -> AnyResult<Self>;
 }
 
@@ -35,13 +36,21 @@ struct FGuid {
     d: u32,
 }
 
-impl Deserializable for FGuid {
+impl UPKPart for FGuid {
+    fn serialize(&self, writer: &mut impl Write) -> AnyResult<()> {
+        writer.write_u32::<LittleEndian>(self.a).unwrap();
+        writer.write_u32::<LittleEndian>(self.b).unwrap();
+        writer.write_u32::<LittleEndian>(self.c).unwrap();
+        writer.write_u32::<LittleEndian>(self.d).unwrap();
+        Ok(())
+    }
+
     fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
         Ok(Self {
-            a: reader.read_u32::<LittleEndian>()?,
-            b: reader.read_u32::<LittleEndian>()?,
-            c: reader.read_u32::<LittleEndian>()?,
-            d: reader.read_u32::<LittleEndian>()?,
+            a: reader.read_u32::<LittleEndian>().unwrap(),
+            b: reader.read_u32::<LittleEndian>().unwrap(),
+            c: reader.read_u32::<LittleEndian>().unwrap(),
+            d: reader.read_u32::<LittleEndian>().unwrap(),
         })
     }
 }
@@ -52,28 +61,55 @@ struct FString {
     is_unicode: bool,
 }
 
-impl Deserializable for FString {
+impl UPKPart for FString {
+    fn serialize(&self, writer: &mut impl Write) -> AnyResult<()> {
+        if self.is_unicode {
+            let utf16: Vec<_> = self.inner.encode_utf16().collect();
+            writer
+                .write_i32::<LittleEndian>(-i32::try_from(utf16.len() + 1).unwrap())
+                .unwrap();
+
+            for word in utf16 {
+                writer.write_u16::<LittleEndian>(word).unwrap();
+            }
+
+            // null terminator
+            writer.write_u16::<LittleEndian>(0).unwrap();
+        } else {
+            let utf8 = self.inner.as_bytes();
+            writer
+                .write_i32::<LittleEndian>(i32::try_from(utf8.len() + 1).unwrap())
+                .unwrap();
+            for byte in utf8 {
+                writer.write_u8(*byte).unwrap();
+            }
+            writer.write_u8(0).unwrap();
+        }
+
+        Ok(())
+    }
+
     fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
-        let length = reader.read_i32::<LittleEndian>()?;
+        let length = reader.read_i32::<LittleEndian>().unwrap();
         let is_unicode = length < 0;
 
         let decoded = if is_unicode {
             let n_words = -length as usize;
 
-            let mut raw = Cursor::new(reader.read_words(n_words)?);
+            let mut raw = Cursor::new(reader.read_words(n_words).unwrap());
             let mut utf16s = Vec::with_capacity(n_words);
             // - 1 for null terminator
             for _ in 0..(n_words - 1) {
-                let word = raw.read_u16::<LittleEndian>()?;
+                let word = raw.read_u16::<LittleEndian>().unwrap();
                 utf16s.push(word);
             }
 
-            String::from_utf16(&utf16s)?
+            String::from_utf16(&utf16s).unwrap()
         } else {
             let n_letters = length as usize;
-            let mut raw = reader.read_bytes(n_letters)?;
+            let mut raw = reader.read_bytes(n_letters).unwrap();
             raw.pop(); // null terminator
-            String::from_utf8(raw)?
+            String::from_utf8(raw).unwrap()
         };
 
         Ok(Self {
@@ -84,16 +120,27 @@ impl Deserializable for FString {
 }
 
 #[derive(Debug)]
-struct TArray<T: Deserializable> {
+struct TArray<T: UPKPart> {
     inner: Vec<T>,
 }
 
-impl<T: Deserializable> Deserializable for TArray<T> {
+impl<T: UPKPart> UPKPart for TArray<T> {
+    fn serialize(&self, writer: &mut impl Write) -> AnyResult<()> {
+        writer
+            .write_i32::<LittleEndian>(self.inner.len() as i32)
+            .unwrap();
+        for element in &self.inner {
+            element.serialize(writer).unwrap();
+        }
+
+        Ok(())
+    }
+
     fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
-        let length = reader.read_i32::<LittleEndian>()? as usize;
+        let length = reader.read_i32::<LittleEndian>().unwrap() as usize;
         let mut list = Vec::with_capacity(length);
         for _ in 0..length {
-            let element = T::deserialize(reader)?;
+            let element = T::deserialize(reader).unwrap();
             list.push(element);
         }
 
@@ -101,9 +148,14 @@ impl<T: Deserializable> Deserializable for TArray<T> {
     }
 }
 
-impl Deserializable for i32 {
+impl UPKPart for i32 {
+    fn serialize(&self, writer: &mut impl Write) -> AnyResult<()> {
+        writer.write_i32::<LittleEndian>(*self).unwrap();
+        Ok(())
+    }
+
     fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
-        let val = reader.read_i32::<LittleEndian>()?;
+        let val = reader.read_i32::<LittleEndian>().unwrap();
         Ok(val)
     }
 }
@@ -115,12 +167,22 @@ struct FGenerationInfo {
     net_object_count: i32,
 }
 
-impl Deserializable for FGenerationInfo {
+impl UPKPart for FGenerationInfo {
+    fn serialize(&self, writer: &mut impl Write) -> AnyResult<()> {
+        writer.write_i32::<LittleEndian>(self.export_count).unwrap();
+        writer.write_i32::<LittleEndian>(self.name_count).unwrap();
+        writer
+            .write_i32::<LittleEndian>(self.net_object_count)
+            .unwrap();
+
+        Ok(())
+    }
+
     fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
         Ok(Self {
-            export_count: reader.read_i32::<LittleEndian>()?,
-            name_count: reader.read_i32::<LittleEndian>()?,
-            net_object_count: reader.read_i32::<LittleEndian>()?,
+            export_count: reader.read_i32::<LittleEndian>().unwrap(),
+            name_count: reader.read_i32::<LittleEndian>().unwrap(),
+            net_object_count: reader.read_i32::<LittleEndian>().unwrap(),
         })
     }
 }
@@ -133,13 +195,29 @@ struct FCompressedChunkInfo {
     compressed_size: i32,
 }
 
-impl Deserializable for FCompressedChunkInfo {
+impl UPKPart for FCompressedChunkInfo {
+    fn serialize(&self, writer: &mut impl Write) -> AnyResult<()> {
+        writer
+            .write_i64::<LittleEndian>(self.uncompressed_offset)
+            .unwrap();
+        writer
+            .write_i32::<LittleEndian>(self.uncompressed_size)
+            .unwrap();
+        writer
+            .write_i64::<LittleEndian>(self.compressed_offset)
+            .unwrap();
+        writer
+            .write_i32::<LittleEndian>(self.compressed_size)
+            .unwrap();
+        Ok(())
+    }
+
     fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
         Ok(Self {
-            uncompressed_offset: reader.read_i64::<LittleEndian>()?,
-            uncompressed_size: reader.read_i32::<LittleEndian>()?,
-            compressed_offset: reader.read_i64::<LittleEndian>()?,
-            compressed_size: reader.read_i32::<LittleEndian>()?,
+            uncompressed_offset: reader.read_i64::<LittleEndian>().unwrap(),
+            uncompressed_size: reader.read_i32::<LittleEndian>().unwrap(),
+            compressed_offset: reader.read_i64::<LittleEndian>().unwrap(),
+            compressed_size: reader.read_i32::<LittleEndian>().unwrap(),
         })
     }
 }
@@ -155,15 +233,26 @@ struct FUnknownTypeInFPackageFileSummary {
     unknown_6: TArray<i32>,
 }
 
-impl Deserializable for FUnknownTypeInFPackageFileSummary {
+impl UPKPart for FUnknownTypeInFPackageFileSummary {
+    fn serialize(&self, writer: &mut impl Write) -> AnyResult<()> {
+        writer.write_i32::<LittleEndian>(self.unknown_1).unwrap();
+        writer.write_i32::<LittleEndian>(self.unknown_2).unwrap();
+        writer.write_i32::<LittleEndian>(self.unknown_3).unwrap();
+        writer.write_i32::<LittleEndian>(self.unknown_4).unwrap();
+        writer.write_i32::<LittleEndian>(self.unknown_5).unwrap();
+        TArray::serialize(&self.unknown_6, writer).unwrap();
+
+        Ok(())
+    }
+
     fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
         Ok(Self {
-            unknown_1: reader.read_i32::<LittleEndian>()?,
-            unknown_2: reader.read_i32::<LittleEndian>()?,
-            unknown_3: reader.read_i32::<LittleEndian>()?,
-            unknown_4: reader.read_i32::<LittleEndian>()?,
-            unknown_5: reader.read_i32::<LittleEndian>()?,
-            unknown_6: TArray::deserialize(reader)?,
+            unknown_1: reader.read_i32::<LittleEndian>().unwrap(),
+            unknown_2: reader.read_i32::<LittleEndian>().unwrap(),
+            unknown_3: reader.read_i32::<LittleEndian>().unwrap(),
+            unknown_4: reader.read_i32::<LittleEndian>().unwrap(),
+            unknown_5: reader.read_i32::<LittleEndian>().unwrap(),
+            unknown_6: TArray::deserialize(reader).unwrap(),
         })
     }
 }
@@ -210,45 +299,108 @@ struct FPackageFileSummary {
     last_aes_block_size: i32,
 }
 
-impl Deserializable for FPackageFileSummary {
+impl UPKPart for FPackageFileSummary {
+    fn serialize(&self, writer: &mut impl Write) -> AnyResult<()> {
+        writer.write_u32::<LittleEndian>(self.tag).unwrap();
+        writer.write_u16::<LittleEndian>(self.file_version).unwrap();
+        writer
+            .write_u16::<LittleEndian>(self.licensee_version)
+            .unwrap();
+        writer
+            .write_i32::<LittleEndian>(self.total_header_size)
+            .unwrap();
+        FString::serialize(&self.folder_name, writer).unwrap();
+        writer
+            .write_u32::<LittleEndian>(self.package_flags)
+            .unwrap();
+
+        writer.write_i32::<LittleEndian>(self.name_count).unwrap();
+        writer.write_i32::<LittleEndian>(self.name_offset).unwrap();
+        writer.write_i32::<LittleEndian>(self.export_count).unwrap();
+        writer
+            .write_i32::<LittleEndian>(self.export_offset)
+            .unwrap();
+        writer.write_i32::<LittleEndian>(self.import_count).unwrap();
+        writer
+            .write_i32::<LittleEndian>(self.import_offset)
+            .unwrap();
+        writer
+            .write_i32::<LittleEndian>(self.depends_offset)
+            .unwrap();
+
+        writer.write_i32::<LittleEndian>(self.unknown_1).unwrap();
+        writer.write_i32::<LittleEndian>(self.unknown_2).unwrap();
+        writer.write_i32::<LittleEndian>(self.unknown_3).unwrap();
+        writer.write_i32::<LittleEndian>(self.unknown_4).unwrap();
+
+        FGuid::serialize(&self.guid, writer).unwrap();
+        TArray::serialize(&self.generations, writer).unwrap();
+
+        writer
+            .write_u32::<LittleEndian>(self.engine_version)
+            .unwrap();
+        writer
+            .write_u32::<LittleEndian>(self.cooker_version)
+            .unwrap();
+        writer
+            .write_i32::<LittleEndian>(self._compression_flags)
+            .unwrap();
+
+        TArray::serialize(&self.compressed_chunks, writer).unwrap();
+        writer.write_i32::<LittleEndian>(self.unknown_5).unwrap();
+
+        TArray::serialize(&self.unknown_6, writer).unwrap();
+        TArray::serialize(&self.unknown_7, writer).unwrap();
+
+        writer.write_i32::<LittleEndian>(self.garbage_size).unwrap();
+        writer
+            .write_i32::<LittleEndian>(self.compressed_chunk_info_offset)
+            .unwrap();
+        writer
+            .write_i32::<LittleEndian>(self.last_aes_block_size)
+            .unwrap();
+
+        Ok(())
+    }
+
     fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
         Ok(Self {
-            tag: reader.read_u32::<LittleEndian>()?,
-            file_version: reader.read_u16::<LittleEndian>()?,
-            licensee_version: reader.read_u16::<LittleEndian>()?,
-            total_header_size: reader.read_i32::<LittleEndian>()?,
-            folder_name: FString::deserialize(reader)?,
-            package_flags: reader.read_u32::<LittleEndian>()?,
+            tag: reader.read_u32::<LittleEndian>().unwrap(),
+            file_version: reader.read_u16::<LittleEndian>().unwrap(),
+            licensee_version: reader.read_u16::<LittleEndian>().unwrap(),
+            total_header_size: reader.read_i32::<LittleEndian>().unwrap(),
+            folder_name: FString::deserialize(reader).unwrap(),
+            package_flags: reader.read_u32::<LittleEndian>().unwrap(),
 
-            name_count: reader.read_i32::<LittleEndian>()?,
-            name_offset: reader.read_i32::<LittleEndian>()?,
-            export_count: reader.read_i32::<LittleEndian>()?,
-            export_offset: reader.read_i32::<LittleEndian>()?,
-            import_count: reader.read_i32::<LittleEndian>()?,
-            import_offset: reader.read_i32::<LittleEndian>()?,
-            depends_offset: reader.read_i32::<LittleEndian>()?,
+            name_count: reader.read_i32::<LittleEndian>().unwrap(),
+            name_offset: reader.read_i32::<LittleEndian>().unwrap(),
+            export_count: reader.read_i32::<LittleEndian>().unwrap(),
+            export_offset: reader.read_i32::<LittleEndian>().unwrap(),
+            import_count: reader.read_i32::<LittleEndian>().unwrap(),
+            import_offset: reader.read_i32::<LittleEndian>().unwrap(),
+            depends_offset: reader.read_i32::<LittleEndian>().unwrap(),
 
-            unknown_1: reader.read_i32::<LittleEndian>()?,
-            unknown_2: reader.read_i32::<LittleEndian>()?,
-            unknown_3: reader.read_i32::<LittleEndian>()?,
-            unknown_4: reader.read_i32::<LittleEndian>()?,
+            unknown_1: reader.read_i32::<LittleEndian>().unwrap(),
+            unknown_2: reader.read_i32::<LittleEndian>().unwrap(),
+            unknown_3: reader.read_i32::<LittleEndian>().unwrap(),
+            unknown_4: reader.read_i32::<LittleEndian>().unwrap(),
 
-            guid: FGuid::deserialize(reader)?,
-            generations: TArray::deserialize(reader)?,
+            guid: FGuid::deserialize(reader).unwrap(),
+            generations: TArray::deserialize(reader).unwrap(),
 
-            engine_version: reader.read_u32::<LittleEndian>()?,
-            cooker_version: reader.read_u32::<LittleEndian>()?,
-            _compression_flags: reader.read_i32::<LittleEndian>()?,
+            engine_version: reader.read_u32::<LittleEndian>().unwrap(),
+            cooker_version: reader.read_u32::<LittleEndian>().unwrap(),
+            _compression_flags: reader.read_i32::<LittleEndian>().unwrap(),
 
-            compressed_chunks: TArray::deserialize(reader)?,
-            unknown_5: reader.read_i32::<LittleEndian>()?,
+            compressed_chunks: TArray::deserialize(reader).unwrap(),
+            unknown_5: reader.read_i32::<LittleEndian>().unwrap(),
 
-            unknown_6: TArray::deserialize(reader)?,
-            unknown_7: TArray::deserialize(reader)?,
+            unknown_6: TArray::deserialize(reader).unwrap(),
+            unknown_7: TArray::deserialize(reader).unwrap(),
 
-            garbage_size: reader.read_i32::<LittleEndian>()?,
-            compressed_chunk_info_offset: reader.read_i32::<LittleEndian>()?,
-            last_aes_block_size: reader.read_i32::<LittleEndian>()?,
+            garbage_size: reader.read_i32::<LittleEndian>().unwrap(),
+            compressed_chunk_info_offset: reader.read_i32::<LittleEndian>().unwrap(),
+            last_aes_block_size: reader.read_i32::<LittleEndian>().unwrap(),
         })
     }
 }
@@ -258,7 +410,13 @@ const AES_KEY: [u8; 32] = [
     0x7F, 0xE5, 0x00, 0xB7, 0x7F, 0xA5, 0xFA, 0xB2, 0x93, 0xE2, 0xF2, 0x4E, 0x6B, 0x17, 0xE7, 0x79,
 ];
 
-// note: in-place
+fn encrypt(buffer: &mut [u8]) {
+    let cipher = Aes256::new((&AES_KEY).into());
+    for chunk in buffer.chunks_exact_mut(16) {
+        cipher.encrypt_block(chunk.try_into().unwrap());
+    }
+}
+
 fn decrypt(buffer: &mut [u8]) {
     let cipher = Aes256::new((&AES_KEY).into());
     for chunk in buffer.chunks_exact_mut(16) {
@@ -272,11 +430,19 @@ struct FNameRef {
     instance_number: i32,
 }
 
-impl Deserializable for FNameRef {
+impl UPKPart for FNameRef {
+    fn serialize(&self, writer: &mut impl Write) -> AnyResult<()> {
+        writer.write_i32::<LittleEndian>(self.name_index).unwrap();
+        writer
+            .write_i32::<LittleEndian>(self.instance_number)
+            .unwrap();
+        Ok(())
+    }
+
     fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
         Ok(Self {
-            name_index: reader.read_i32::<LittleEndian>()?,
-            instance_number: reader.read_i32::<LittleEndian>()?,
+            name_index: reader.read_i32::<LittleEndian>().unwrap(),
+            instance_number: reader.read_i32::<LittleEndian>().unwrap(),
         })
     }
 }
@@ -289,13 +455,22 @@ struct FImportEntry {
     object_name: FNameRef,
 }
 
-impl Deserializable for FImportEntry {
+impl UPKPart for FImportEntry {
+    fn serialize(&self, writer: &mut impl Write) -> AnyResult<()> {
+        FNameRef::serialize(&self.class_package, writer).unwrap();
+        FNameRef::serialize(&self.class_name, writer).unwrap();
+        writer.write_i32::<LittleEndian>(self.outer_index).unwrap();
+        FNameRef::serialize(&self.object_name, writer).unwrap();
+
+        Ok(())
+    }
+
     fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
         Ok(Self {
-            class_package: FNameRef::deserialize(reader)?,
-            class_name: FNameRef::deserialize(reader)?,
-            outer_index: reader.read_i32::<LittleEndian>()?,
-            object_name: FNameRef::deserialize(reader)?,
+            class_package: FNameRef::deserialize(reader).unwrap(),
+            class_name: FNameRef::deserialize(reader).unwrap(),
+            outer_index: reader.read_i32::<LittleEndian>().unwrap(),
+            object_name: FNameRef::deserialize(reader).unwrap(),
         })
     }
 }
@@ -306,11 +481,18 @@ struct FNameEntry {
     flags: u64,
 }
 
-impl Deserializable for FNameEntry {
+impl UPKPart for FNameEntry {
+    fn serialize(&self, writer: &mut impl Write) -> AnyResult<()> {
+        FString::serialize(&self.name, writer).unwrap();
+        writer.write_u64::<LittleEndian>(self.flags).unwrap();
+
+        Ok(())
+    }
+
     fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
         Ok(Self {
-            name: FString::deserialize(reader)?,
-            flags: reader.read_u64::<LittleEndian>()?,
+            name: FString::deserialize(reader).unwrap(),
+            flags: reader.read_u64::<LittleEndian>().unwrap(),
         })
     }
 }
@@ -331,21 +513,44 @@ struct FExportEntry {
     package_flags: i32,
 }
 
-impl Deserializable for FExportEntry {
+impl UPKPart for FExportEntry {
+    fn serialize(&self, writer: &mut impl Write) -> AnyResult<()> {
+        writer.write_i32::<LittleEndian>(self.class_index).unwrap();
+        writer.write_i32::<LittleEndian>(self.super_index).unwrap();
+        writer.write_i32::<LittleEndian>(self.outer_index).unwrap();
+        FNameRef::serialize(&self.object_name, writer).unwrap();
+        writer
+            .write_i32::<LittleEndian>(self.archetype_index)
+            .unwrap();
+        writer.write_u64::<LittleEndian>(self.object_flags).unwrap();
+        writer.write_i32::<LittleEndian>(self.serial_size).unwrap();
+        writer
+            .write_i64::<LittleEndian>(self.serial_offset)
+            .unwrap();
+        writer.write_i32::<LittleEndian>(self.export_flags).unwrap();
+        TArray::serialize(&self.net_objects, writer).unwrap();
+        FGuid::serialize(&self.package_guid, writer).unwrap();
+        writer
+            .write_i32::<LittleEndian>(self.package_flags)
+            .unwrap();
+
+        Ok(())
+    }
+
     fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
         Ok(Self {
-            class_index: reader.read_i32::<LittleEndian>()?,
-            super_index: reader.read_i32::<LittleEndian>()?,
-            outer_index: reader.read_i32::<LittleEndian>()?,
-            object_name: FNameRef::deserialize(reader)?,
-            archetype_index: reader.read_i32::<LittleEndian>()?,
-            object_flags: reader.read_u64::<LittleEndian>()?,
-            serial_size: reader.read_i32::<LittleEndian>()?,
-            serial_offset: reader.read_i64::<LittleEndian>()?,
-            export_flags: reader.read_i32::<LittleEndian>()?,
-            net_objects: TArray::deserialize(reader)?,
-            package_guid: FGuid::deserialize(reader)?,
-            package_flags: reader.read_i32::<LittleEndian>()?,
+            class_index: reader.read_i32::<LittleEndian>().unwrap(),
+            super_index: reader.read_i32::<LittleEndian>().unwrap(),
+            outer_index: reader.read_i32::<LittleEndian>().unwrap(),
+            object_name: FNameRef::deserialize(reader).unwrap(),
+            archetype_index: reader.read_i32::<LittleEndian>().unwrap(),
+            object_flags: reader.read_u64::<LittleEndian>().unwrap(),
+            serial_size: reader.read_i32::<LittleEndian>().unwrap(),
+            serial_offset: reader.read_i64::<LittleEndian>().unwrap(),
+            export_flags: reader.read_i32::<LittleEndian>().unwrap(),
+            net_objects: TArray::deserialize(reader).unwrap(),
+            package_guid: FGuid::deserialize(reader).unwrap(),
+            package_flags: reader.read_i32::<LittleEndian>().unwrap(),
         })
     }
 }
@@ -356,12 +561,16 @@ struct Upk {
     names: Vec<FNameEntry>,
     imports: Vec<FImportEntry>,
     exports: Vec<FExportEntry>,
+    // i can't figure out how to parse the depends table and whatever magic
+    // comes after that, but i don't think it matters so screw it
+    remaining_header: Vec<u8>,
     compressed_data: Vec<u8>,
 }
 
 impl Upk {
     fn new(mut reader: impl Read + Seek) -> AnyResult<Self> {
-        let summary = FPackageFileSummary::deserialize(&mut reader)?;
+        let summary = FPackageFileSummary::deserialize(&mut reader).unwrap();
+        println!("{summary:#?}");
         if summary.tag == PACKAGE_FILE_TAG {
             println!("package tag is correct :)");
         } else {
@@ -372,66 +581,138 @@ impl Upk {
         let actual_encrypted_size =
             summary.total_header_size - summary.garbage_size - summary.name_offset;
         let encrypted_size = (actual_encrypted_size + 15) & !15; // roudns up to nearest aes block
-        reader.seek(io::SeekFrom::Start(summary.name_offset as u64))?;
-        let mut package = vec![0u8; encrypted_size as usize];
+        reader
+            .seek(io::SeekFrom::Start(summary.name_offset as u64))
+            .unwrap();
 
-        reader.read_exact(&mut package)?;
-        decrypt(&mut package);
+        let mut tables_data = vec![0u8; encrypted_size as usize];
+        reader.read_exact(&mut tables_data).unwrap();
+        decrypt(&mut tables_data);
+        fs::write("decrypted_tables.bin", &tables_data).unwrap();
 
-        let mut reader = Cursor::new(package);
-
+        let mut tables_reader = Cursor::new(tables_data);
         // after this point, the summary offsets are wrong because the reader's ZERO is
         // actually summary.name_offset. so, we have to subtract summary.name_offset for stuff
 
         let mut names = Vec::with_capacity(summary.name_count as usize);
         for _ in 0..summary.name_count {
-            let entry = FNameEntry::deserialize(&mut reader)?;
+            let entry = FNameEntry::deserialize(&mut tables_reader).unwrap();
             names.push(entry);
         }
 
-        reader.seek(io::SeekFrom::Start(
-            (summary.import_offset - summary.name_offset) as u64,
-        ))?;
+        tables_reader
+            .seek(io::SeekFrom::Start(
+                (summary.import_offset - summary.name_offset) as u64,
+            ))
+            .unwrap();
         let mut imports = Vec::with_capacity(summary.import_count as usize);
         for _ in 0..summary.import_count {
-            let entry = FImportEntry::deserialize(&mut reader)?;
+            let entry = FImportEntry::deserialize(&mut tables_reader).unwrap();
             imports.push(entry);
         }
 
-        reader.seek(io::SeekFrom::Start(
-            (summary.export_offset - summary.name_offset) as u64,
-        ))?;
+        tables_reader
+            .seek(io::SeekFrom::Start(
+                (summary.export_offset - summary.name_offset) as u64,
+            ))
+            .unwrap();
         let mut exports = Vec::with_capacity(summary.export_count as usize);
         for _ in 0..summary.export_count {
-            let entry = FExportEntry::deserialize(&mut reader)?;
+            let entry = FExportEntry::deserialize(&mut tables_reader).unwrap();
             exports.push(entry);
         }
 
+        tables_reader
+            .seek(io::SeekFrom::Start(
+                (summary.depends_offset - summary.name_offset) as u64,
+            ))
+            .unwrap();
+        let mut remaining_header = Vec::new();
+        tables_reader.read_to_end(&mut remaining_header).unwrap();
+
         let total_size = {
-            reader.seek(io::SeekFrom::End(0))?;
-            reader.stream_position()?
+            reader.seek(io::SeekFrom::End(0)).unwrap();
+            reader.stream_position().unwrap()
         };
         let compressed_data_size =
             total_size as usize - (summary.compressed_chunk_info_offset as usize);
         let mut compressed_data = vec![0u8; compressed_data_size];
-        reader.seek(io::SeekFrom::Start(
-            summary.compressed_chunk_info_offset as u64,
-        ))?;
-        reader.read_exact(&mut compressed_data)?;
+        reader
+            .seek(io::SeekFrom::Start(
+                summary.compressed_chunk_info_offset as u64,
+            ))
+            .unwrap();
+        reader.read_exact(&mut compressed_data).unwrap();
 
         Ok(Self {
             summary,
             names,
             imports,
             exports,
+            remaining_header,
             compressed_data,
         })
+    }
+
+    fn serialize(&self) -> AnyResult<Vec<u8>> {
+        let mut serialized = Vec::new();
+        self.summary.serialize(&mut serialized).unwrap();
+        fs::write("my_own_summary.bin", &serialized).unwrap();
+        let summary_size = serialized.len();
+
+        // okay so the spacing is part of the summary not the tables, we cant encrypt the
+        // padding zeros. so we remove the padding zeros by subtracting from the seek offset
+        // and put them in the summary instead.
+        let space_in_between_sum_and_header = self.summary.name_offset as usize - serialized.len();
+        serialized.extend(vec![0u8; space_in_between_sum_and_header]);
+        let encrypted_header = {
+            let mut header = Cursor::new(Vec::new());
+            let offset_seek =
+                |offset| (offset as usize - summary_size - space_in_between_sum_and_header) as u64;
+
+            header
+                .seek(SeekFrom::Start(offset_seek(self.summary.name_offset)))
+                .unwrap();
+            for name in &self.names {
+                name.serialize(&mut header).unwrap();
+            }
+
+            header
+                .seek(SeekFrom::Start(offset_seek(self.summary.import_offset)))
+                .unwrap();
+            for import in &self.imports {
+                import.serialize(&mut header).unwrap();
+            }
+
+            header
+                .seek(SeekFrom::Start(offset_seek(self.summary.export_offset)))
+                .unwrap();
+            for export in &self.exports {
+                export.serialize(&mut header).unwrap();
+            }
+
+            header
+                .seek(SeekFrom::Start(offset_seek(self.summary.depends_offset)))
+                .unwrap();
+            header.write(&self.remaining_header).unwrap();
+
+            let mut header = header.into_inner();
+            fs::write("bubbles_tables_my_own.bin", &header).unwrap();
+            encrypt(&mut header);
+            header
+        };
+        serialized.write(&encrypted_header).unwrap();
+
+        Ok(serialized)
     }
 }
 
 fn main() -> AnyResult<()> {
-    let upk = Upk::new(fs::File::open("body_grain_SF.upk")?)?;
-    println!("{:#?}", upk.names);
+    // let bubbles = Upk::new(fs::File::open("boost_Bubble_SF_2.upk").unwrap()).unwrap();
+
+    let bubbles = Upk::new(fs::File::open("boost_Bubble_SF.upk").unwrap()).unwrap();
+    let serialized = bubbles.serialize().unwrap();
+    fs::write("boost_Bubble_SF_2.upk", &serialized).unwrap();
 
     Ok(())
 }
