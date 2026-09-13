@@ -356,6 +356,7 @@ struct Upk {
     names: Vec<FNameEntry>,
     imports: Vec<FImportEntry>,
     exports: Vec<FExportEntry>,
+    compressed_data: Vec<u8>,
 }
 
 impl Upk {
@@ -406,11 +407,24 @@ impl Upk {
             exports.push(entry);
         }
 
+        let total_size = {
+            reader.seek(io::SeekFrom::End(0))?;
+            reader.stream_position()?
+        };
+        let compressed_data_size =
+            total_size as usize - (summary.compressed_chunk_info_offset as usize);
+        let mut compressed_data = vec![0u8; compressed_data_size];
+        reader.seek(io::SeekFrom::Start(
+            summary.compressed_chunk_info_offset as u64,
+        ))?;
+        reader.read_exact(&mut compressed_data)?;
+
         Ok(Self {
             summary,
             names,
             imports,
             exports,
+            compressed_data,
         })
     }
 }
