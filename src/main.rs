@@ -62,7 +62,8 @@ impl Deserializable for FString {
 
             let mut raw = Cursor::new(reader.read_words(n_words)?);
             let mut utf16s = Vec::with_capacity(n_words);
-            for _ in 0..n_words {
+            // - 1 for null terminator
+            for _ in 0..(n_words - 1) {
                 let word = raw.read_u16::<LittleEndian>()?;
                 utf16s.push(word);
             }
