@@ -581,12 +581,14 @@ impl Upk {
         let actual_encrypted_size =
             summary.total_header_size - summary.garbage_size - summary.name_offset;
         let encrypted_size = (actual_encrypted_size + 15) & !15; // roudns up to nearest aes block
+
         reader
             .seek(io::SeekFrom::Start(summary.name_offset as u64))
             .unwrap();
 
         let mut tables_data = vec![0u8; encrypted_size as usize];
         reader.read_exact(&mut tables_data).unwrap();
+        fs::write("encrypted_tables.bin", &tables_data).unwrap();
         decrypt(&mut tables_data);
         fs::write("decrypted_tables.bin", &tables_data).unwrap();
 
@@ -630,19 +632,13 @@ impl Upk {
         let mut remaining_header = Vec::new();
         tables_reader.read_to_end(&mut remaining_header).unwrap();
 
-        let total_size = {
-            reader.seek(io::SeekFrom::End(0)).unwrap();
-            reader.stream_position().unwrap()
-        };
-        let compressed_data_size =
-            total_size as usize - (summary.compressed_chunk_info_offset as usize);
-        let mut compressed_data = vec![0u8; compressed_data_size];
-        reader
-            .seek(io::SeekFrom::Start(
-                summary.compressed_chunk_info_offset as u64,
-            ))
-            .unwrap();
-        reader.read_exact(&mut compressed_data).unwrap();
+        // remaining data just after tables
+        let tables_end = summary.name_offset as u64 + tables_reader.stream_position().unwrap();
+        let mut compressed_data = Vec::new();
+        reader.seek(io::SeekFrom::Start(tables_end as u64)).unwrap();
+        reader.read_to_end(&mut compressed_data).unwrap();
+
+        fs::write("compressed.bin", &compressed_data).unwrap();
 
         Ok(Self {
             summary,
@@ -699,9 +695,11 @@ impl Upk {
             let mut header = header.into_inner();
             fs::write("bubbles_tables_my_own.bin", &header).unwrap();
             encrypt(&mut header);
+            fs::write("bubbles_tables_my_own_encrypted.bin", &header).unwrap();
             header
         };
         serialized.write(&encrypted_header).unwrap();
+        serialized.write(&self.compressed_data).unwrap();
 
         Ok(serialized)
     }
