@@ -28,7 +28,7 @@ trait UPKPart: Sized {
     fn deserialize(reader: &mut impl Read) -> AnyResult<Self>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FGuid {
     a: u32,
     b: u32,
@@ -55,7 +55,7 @@ impl UPKPart for FGuid {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FString {
     inner: String,
     is_unicode: bool,
@@ -119,7 +119,7 @@ impl UPKPart for FString {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TArray<T: UPKPart> {
     inner: Vec<T>,
 }
@@ -160,7 +160,7 @@ impl UPKPart for i32 {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FGenerationInfo {
     export_count: i32,
     name_count: i32,
@@ -187,7 +187,7 @@ impl UPKPart for FGenerationInfo {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FCompressedChunkInfo {
     uncompressed_offset: i64,
     uncompressed_size: i32,
@@ -223,7 +223,7 @@ impl UPKPart for FCompressedChunkInfo {
 }
 
 // nobody knows
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FUnknownTypeInFPackageFileSummary {
     unknown_1: i32,
     unknown_2: i32,
@@ -259,7 +259,7 @@ impl UPKPart for FUnknownTypeInFPackageFileSummary {
 
 const PACKAGE_FILE_TAG: u32 = 0x9E2A83C1;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FPackageFileSummary {
     tag: u32,
     file_version: u16,
@@ -424,7 +424,7 @@ fn decrypt(buffer: &mut [u8]) {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FNameRef {
     name_index: i32,
     instance_number: i32,
@@ -447,7 +447,7 @@ impl UPKPart for FNameRef {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FImportEntry {
     class_package: FNameRef,
     class_name: FNameRef,
@@ -475,7 +475,7 @@ impl UPKPart for FImportEntry {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FNameEntry {
     name: FString,
     flags: u64,
@@ -497,7 +497,7 @@ impl UPKPart for FNameEntry {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FExportEntry {
     class_index: i32,
     super_index: i32,
@@ -651,44 +651,43 @@ impl Upk {
     }
 
     fn serialize(&self) -> AnyResult<Vec<u8>> {
-        let mut serialized = Vec::new();
-        self.summary.serialize(&mut serialized).unwrap();
-        fs::write("my_own_summary.bin", &serialized).unwrap();
-        let summary_size = serialized.len();
+        let summary_size = {
+            let mut serialized_summary = Vec::new();
+            self.summary.serialize(&mut serialized_summary).unwrap();
+            serialized_summary.len()
+        };
+        let mut modified_summary = self.summary.clone(); // will perform surgery after
+        let summary_padding_size = self.summary.name_offset - summary_size as i32;
 
-        // okay so the spacing is part of the summary not the tables, we cant encrypt the
-        // padding zeros. so we remove the padding zeros by subtracting from the seek offset
-        // and put them in the summary instead.
-        let space_in_between_sum_and_header = self.summary.name_offset as usize - serialized.len();
-        serialized.extend(vec![0u8; space_in_between_sum_and_header]);
         let encrypted_header = {
             let mut header = Cursor::new(Vec::new());
-            let offset_seek =
-                |offset| (offset as usize - summary_size - space_in_between_sum_and_header) as u64;
+            let current_global_offset = |header: &mut Cursor<Vec<u8>>| {
+                header.stream_position().unwrap() as i32
+                    + summary_size as i32
+                    + summary_padding_size
+            };
 
-            header
-                .seek(SeekFrom::Start(offset_seek(self.summary.name_offset)))
-                .unwrap();
+            modified_summary.name_offset = current_global_offset(&mut header);
             for name in &self.names {
                 name.serialize(&mut header).unwrap();
             }
 
-            header
-                .seek(SeekFrom::Start(offset_seek(self.summary.import_offset)))
-                .unwrap();
+            modified_summary.import_offset = current_global_offset(&mut header);
             for import in &self.imports {
                 import.serialize(&mut header).unwrap();
             }
 
-            header
-                .seek(SeekFrom::Start(offset_seek(self.summary.export_offset)))
-                .unwrap();
+            modified_summary.export_offset = current_global_offset(&mut header);
             for export in &self.exports {
                 export.serialize(&mut header).unwrap();
             }
 
+            // im not gonna change any other part of the summary because im not totally sure
+            // what other offsets are important
             header
-                .seek(SeekFrom::Start(offset_seek(self.summary.depends_offset)))
+                .seek(SeekFrom::Start(
+                    (self.summary.depends_offset - self.summary.name_offset) as u64,
+                ))
                 .unwrap();
             header.write(&self.remaining_header).unwrap();
 
@@ -698,6 +697,11 @@ impl Upk {
             fs::write("bubbles_tables_my_own_encrypted.bin", &header).unwrap();
             header
         };
+
+        let mut serialized = Vec::new();
+        modified_summary.serialize(&mut serialized).unwrap();
+        serialized.extend(vec![0u8; summary_padding_size as usize]);
+        fs::write("my_own_summary.bin", &serialized).unwrap();
         serialized.write(&encrypted_header).unwrap();
         serialized.write(&self.compressed_data).unwrap();
 
@@ -706,6 +710,7 @@ impl Upk {
 }
 
 fn main() -> AnyResult<()> {
+    // let bubbles = Upk::new(fs::File::open("boost_Bubble_SF.upk").unwrap()).unwrap();
     // let bubbles = Upk::new(fs::File::open("boost_Bubble_SF_2.upk").unwrap()).unwrap();
 
     let bubbles = Upk::new(fs::File::open("boost_Bubble_SF.upk").unwrap()).unwrap();
