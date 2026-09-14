@@ -222,6 +222,31 @@ impl UPKPart for FCompressedChunkInfo {
     }
 }
 
+// i dont know why this is necessary, but by analyzing it seems to match up.
+// it's an array of the same length as FCompressedChunkInfo, not a TArray
+// It occurs right after TArray<FCompressedChunkInfo> in the encrypted region
+// DO NOT adjust the offsets afaik
+#[derive(Debug, Clone)]
+struct FCompressedChunkAdditionalInfo {
+    offset: i64,
+    size: i32,
+}
+
+impl UPKPart for FCompressedChunkAdditionalInfo {
+    fn serialize(&self, writer: &mut impl Write) -> AnyResult<()> {
+        writer.write_i64::<LittleEndian>(self.offset).unwrap();
+        writer.write_i32::<LittleEndian>(self.size).unwrap();
+        Ok(())
+    }
+
+    fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
+        Ok(Self {
+            offset: reader.read_i64::<LittleEndian>().unwrap(),
+            size: reader.read_i32::<LittleEndian>().unwrap(),
+        })
+    }
+}
+
 // nobody knows
 #[derive(Debug, Clone)]
 struct FUnknownTypeInFPackageFileSummary {
@@ -411,6 +436,10 @@ const AES_KEY: [u8; 32] = [
 ];
 
 fn encrypt(buffer: &mut [u8]) {
+    if buffer.len() % 16 != 0 {
+        panic!("encryption: buffer size isnt divisible by 16!");
+    }
+
     let cipher = Aes256::new((&AES_KEY).into());
     for chunk in buffer.chunks_exact_mut(16) {
         cipher.encrypt_block(chunk.try_into().unwrap());
@@ -418,6 +447,10 @@ fn encrypt(buffer: &mut [u8]) {
 }
 
 fn decrypt(buffer: &mut [u8]) {
+    if buffer.len() % 16 != 0 {
+        panic!("decryption: buffer size isnt divisible by 16!");
+    }
+
     let cipher = Aes256::new((&AES_KEY).into());
     for chunk in buffer.chunks_exact_mut(16) {
         cipher.decrypt_block(chunk.try_into().unwrap());
@@ -555,15 +588,148 @@ impl UPKPart for FExportEntry {
     }
 }
 
-#[derive(Debug)]
-struct Upk {
-    summary: FPackageFileSummary,
+#[derive(Debug, Clone)]
+struct FHeaderEncryptedRegion {
     names: Vec<FNameEntry>,
     imports: Vec<FImportEntry>,
     exports: Vec<FExportEntry>,
-    // i can't figure out how to parse the depends table and whatever magic
-    // comes after that, but i don't think it matters so screw it
-    remaining_header: Vec<u8>,
+    compressed_chunk_info: TArray<FCompressedChunkInfo>,
+    compressed_chunk_extra: Vec<FCompressedChunkAdditionalInfo>,
+    read_region_size: i32,
+}
+
+impl FHeaderEncryptedRegion {
+    fn extract(summary: &FPackageFileSummary, global_reader: &mut (impl Read + Seek)) -> Self {
+        let actual_encrypted_size =
+            summary.total_header_size - summary.garbage_size - summary.name_offset;
+        let encrypted_size = (actual_encrypted_size + 15) & !15; // roudns up to nearest aes block
+
+        global_reader
+            .seek(SeekFrom::Start(summary.name_offset as u64))
+            .unwrap();
+
+        let mut tables_data = vec![0u8; encrypted_size as usize];
+        global_reader.read_exact(&mut tables_data).unwrap();
+        fs::write("encrypted_tables.bin", &tables_data).unwrap();
+        decrypt(&mut tables_data);
+        fs::write("decrypted_tables.bin", &tables_data).unwrap();
+
+        println!("decrypted!");
+        let mut tables_reader = Cursor::new(tables_data);
+        // after this point, the summary offsets are wrong because the reader's ZERO is
+        // actually summary.name_offset. so, we have to subtract summary.name_offset for stuff
+
+        let mut names = Vec::with_capacity(summary.name_count as usize);
+        for _ in 0..summary.name_count {
+            let entry = FNameEntry::deserialize(&mut tables_reader).unwrap();
+            names.push(entry);
+        }
+
+        let mut imports = Vec::with_capacity(summary.import_count as usize);
+        for _ in 0..summary.import_count {
+            let entry = FImportEntry::deserialize(&mut tables_reader).unwrap();
+            imports.push(entry);
+        }
+
+        let mut exports = Vec::with_capacity(summary.export_count as usize);
+        for _ in 0..summary.export_count {
+            let entry = FExportEntry::deserialize(&mut tables_reader).unwrap();
+            exports.push(entry);
+        }
+
+        println!(
+            "finished exports. current position: {}",
+            tables_reader.stream_position().unwrap()
+        );
+        println!(
+            "compressed chunk info position: {}",
+            summary.compressed_chunk_info_offset
+        );
+        let compressed_chunk_info = TArray::deserialize(&mut tables_reader).unwrap();
+        println!(
+            "finished compressed info. current position: {}",
+            tables_reader.stream_position().unwrap()
+        );
+        let mut compressed_chunk_extra = Vec::with_capacity(compressed_chunk_info.inner.len());
+        for _ in 0..compressed_chunk_info.inner.len() {
+            let info = FCompressedChunkAdditionalInfo::deserialize(&mut tables_reader).unwrap();
+            compressed_chunk_extra.push(info);
+        }
+        println!(
+            "finished compressed chunk extra. current position: {}",
+            tables_reader.stream_position().unwrap()
+        );
+
+        Self {
+            names,
+            imports,
+            exports,
+            compressed_chunk_info,
+            compressed_chunk_extra,
+            read_region_size: encrypted_size,
+        }
+    }
+
+    fn re_encrypt(
+        &self,
+        summary_size: i32,
+        summary_padding_size: i32,
+        new_summary: &mut FPackageFileSummary,
+    ) -> Vec<u8> {
+        let mut header = Cursor::new(Vec::new());
+        let current_global_offset = |header: &mut Cursor<Vec<u8>>| {
+            header.stream_position().unwrap() as i32 + summary_size + summary_padding_size
+        };
+
+        new_summary.name_offset = current_global_offset(&mut header);
+        for name in &self.names {
+            name.serialize(&mut header).unwrap();
+        }
+
+        new_summary.import_offset = current_global_offset(&mut header);
+        for import in &self.imports {
+            import.serialize(&mut header).unwrap();
+        }
+
+        new_summary.export_offset = current_global_offset(&mut header);
+        for export in &self.exports {
+            export.serialize(&mut header).unwrap();
+        }
+
+        println!(
+            "serialized exports. stream position: {}",
+            header.stream_position().unwrap()
+        );
+        new_summary.compressed_chunk_info_offset = header.stream_position().unwrap() as i32;
+        new_summary.depends_offset = current_global_offset(&mut header);
+        self.compressed_chunk_info.serialize(&mut header).unwrap();
+
+        for extra in &self.compressed_chunk_extra {
+            extra.serialize(&mut header).unwrap();
+        }
+
+        // aes padding
+        let cursor_position = header.position();
+        let required_cursor_position = (cursor_position + 15) & !15;
+        for i in 0..(required_cursor_position - cursor_position) {
+            let pos = cursor_position + i;
+            print!("{pos} ");
+            let byte = (pos % 0xFF) as u8;
+            header.write_u8(byte).unwrap();
+        }
+
+        let mut header = header.into_inner();
+        fs::write("decrypted_tables_my_own.bin", &header).unwrap();
+        encrypt(&mut header);
+        fs::write("encrypted_tables_my_own.bin", &header).unwrap();
+        header
+    }
+}
+
+#[derive(Debug)]
+struct Upk {
+    summary: FPackageFileSummary,
+    decrypted: FHeaderEncryptedRegion,
     compressed_data: Vec<u8>,
 }
 
@@ -578,74 +744,19 @@ impl Upk {
             return Err("Package tag is incorrect".into());
         }
 
-        let actual_encrypted_size =
-            summary.total_header_size - summary.garbage_size - summary.name_offset;
-        let encrypted_size = (actual_encrypted_size + 15) & !15; // roudns up to nearest aes block
-
-        reader
-            .seek(io::SeekFrom::Start(summary.name_offset as u64))
-            .unwrap();
-
-        let mut tables_data = vec![0u8; encrypted_size as usize];
-        reader.read_exact(&mut tables_data).unwrap();
-        fs::write("encrypted_tables.bin", &tables_data).unwrap();
-        decrypt(&mut tables_data);
-        fs::write("decrypted_tables.bin", &tables_data).unwrap();
-
-        let mut tables_reader = Cursor::new(tables_data);
-        // after this point, the summary offsets are wrong because the reader's ZERO is
-        // actually summary.name_offset. so, we have to subtract summary.name_offset for stuff
-
-        let mut names = Vec::with_capacity(summary.name_count as usize);
-        for _ in 0..summary.name_count {
-            let entry = FNameEntry::deserialize(&mut tables_reader).unwrap();
-            names.push(entry);
-        }
-
-        tables_reader
-            .seek(io::SeekFrom::Start(
-                (summary.import_offset - summary.name_offset) as u64,
-            ))
-            .unwrap();
-        let mut imports = Vec::with_capacity(summary.import_count as usize);
-        for _ in 0..summary.import_count {
-            let entry = FImportEntry::deserialize(&mut tables_reader).unwrap();
-            imports.push(entry);
-        }
-
-        tables_reader
-            .seek(io::SeekFrom::Start(
-                (summary.export_offset - summary.name_offset) as u64,
-            ))
-            .unwrap();
-        let mut exports = Vec::with_capacity(summary.export_count as usize);
-        for _ in 0..summary.export_count {
-            let entry = FExportEntry::deserialize(&mut tables_reader).unwrap();
-            exports.push(entry);
-        }
-
-        tables_reader
-            .seek(io::SeekFrom::Start(
-                (summary.depends_offset - summary.name_offset) as u64,
-            ))
-            .unwrap();
-        let mut remaining_header = Vec::new();
-        tables_reader.read_to_end(&mut remaining_header).unwrap();
+        let decrypted = FHeaderEncryptedRegion::extract(&summary, &mut reader);
 
         // remaining data just after tables
-        let tables_end = summary.name_offset as u64 + tables_reader.stream_position().unwrap();
+        let tables_end = summary.name_offset + decrypted.read_region_size;
         let mut compressed_data = Vec::new();
-        reader.seek(io::SeekFrom::Start(tables_end as u64)).unwrap();
+        reader.seek(SeekFrom::Start(tables_end as u64)).unwrap();
         reader.read_to_end(&mut compressed_data).unwrap();
 
         fs::write("compressed.bin", &compressed_data).unwrap();
 
         Ok(Self {
             summary,
-            names,
-            imports,
-            exports,
-            remaining_header,
+            decrypted,
             compressed_data,
         })
     }
@@ -659,49 +770,16 @@ impl Upk {
         let mut modified_summary = self.summary.clone(); // will perform surgery after
         let summary_padding_size = self.summary.name_offset - summary_size as i32;
 
-        let encrypted_header = {
-            let mut header = Cursor::new(Vec::new());
-            let current_global_offset = |header: &mut Cursor<Vec<u8>>| {
-                header.stream_position().unwrap() as i32
-                    + summary_size as i32
-                    + summary_padding_size
-            };
-
-            modified_summary.name_offset = current_global_offset(&mut header);
-            for name in &self.names {
-                name.serialize(&mut header).unwrap();
-            }
-
-            modified_summary.import_offset = current_global_offset(&mut header);
-            for import in &self.imports {
-                import.serialize(&mut header).unwrap();
-            }
-
-            modified_summary.export_offset = current_global_offset(&mut header);
-            for export in &self.exports {
-                export.serialize(&mut header).unwrap();
-            }
-
-            // im not gonna change any other part of the summary because im not totally sure
-            // what other offsets are important
-            header
-                .seek(SeekFrom::Start(
-                    (self.summary.depends_offset - self.summary.name_offset) as u64,
-                ))
-                .unwrap();
-            header.write(&self.remaining_header).unwrap();
-
-            let mut header = header.into_inner();
-            fs::write("bubbles_tables_my_own.bin", &header).unwrap();
-            encrypt(&mut header);
-            fs::write("bubbles_tables_my_own_encrypted.bin", &header).unwrap();
-            header
-        };
+        let encrypted_header = self.decrypted.re_encrypt(
+            summary_size as i32,
+            summary_padding_size,
+            &mut modified_summary,
+        );
 
         let mut serialized = Vec::new();
         modified_summary.serialize(&mut serialized).unwrap();
         serialized.extend(vec![0u8; summary_padding_size as usize]);
-        fs::write("my_own_summary.bin", &serialized).unwrap();
+        fs::write("summary_my_own.bin", &serialized).unwrap();
         serialized.write(&encrypted_header).unwrap();
         serialized.write(&self.compressed_data).unwrap();
 
@@ -713,8 +791,8 @@ fn main() -> AnyResult<()> {
     // let bubbles = Upk::new(fs::File::open("boost_Bubble_SF.upk").unwrap()).unwrap();
     // let bubbles = Upk::new(fs::File::open("boost_Bubble_SF_2.upk").unwrap()).unwrap();
 
-    let bubbles = Upk::new(fs::File::open("boost_Bubble_SF.upk").unwrap()).unwrap();
-    let serialized = bubbles.serialize().unwrap();
+    let upk = Upk::new(fs::File::open("boost_Bubble_SF.upk").unwrap()).unwrap();
+    let serialized = upk.serialize().unwrap();
     fs::write("boost_Bubble_SF_2.upk", &serialized).unwrap();
 
     Ok(())
