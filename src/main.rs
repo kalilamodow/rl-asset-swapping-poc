@@ -226,6 +226,7 @@ impl UPKPart for FCompressedChunkInfo {
 // it's an array of the same length as FCompressedChunkInfo, not a TArray
 // It occurs right after TArray<FCompressedChunkInfo> in the encrypted region
 // DO NOT adjust the offsets afaik
+// this exists in Summary licensee version 33 but not 32 afaik
 #[derive(Debug, Clone)]
 struct FCompressedChunkAdditionalInfo {
     offset: i64,
@@ -594,7 +595,7 @@ struct FHeaderEncryptedRegion {
     imports: Vec<FImportEntry>,
     exports: Vec<FExportEntry>,
     compressed_chunk_info: TArray<FCompressedChunkInfo>,
-    compressed_chunk_extra: Vec<FCompressedChunkAdditionalInfo>,
+    compressed_chunk_extra: Option<Vec<FCompressedChunkAdditionalInfo>>,
     read_region_size: i32,
 }
 
@@ -650,11 +651,22 @@ impl FHeaderEncryptedRegion {
             "finished compressed info. current position: {}",
             tables_reader.stream_position().unwrap()
         );
-        let mut compressed_chunk_extra = Vec::with_capacity(compressed_chunk_info.inner.len());
-        for _ in 0..compressed_chunk_info.inner.len() {
-            let info = FCompressedChunkAdditionalInfo::deserialize(&mut tables_reader).unwrap();
-            compressed_chunk_extra.push(info);
-        }
+        println!(
+            "qty compressed chunks: {}",
+            compressed_chunk_info.inner.len()
+        );
+        let compressed_chunk_extra = (summary.licensee_version > 32).then(|| {
+            let mut compressed_chunk_extra = Vec::with_capacity(compressed_chunk_info.inner.len());
+            for _ in 0..compressed_chunk_info.inner.len() {
+                let info = FCompressedChunkAdditionalInfo::deserialize(&mut tables_reader).unwrap();
+                compressed_chunk_extra.push(info);
+            }
+            println!(
+                "compressed chunks: {:?}\nextra: {:?}",
+                compressed_chunk_info, compressed_chunk_extra
+            );
+            compressed_chunk_extra
+        });
         println!(
             "finished compressed chunk extra. current position: {}",
             tables_reader.stream_position().unwrap()
@@ -704,8 +716,10 @@ impl FHeaderEncryptedRegion {
         new_summary.depends_offset = current_global_offset(&mut header);
         self.compressed_chunk_info.serialize(&mut header).unwrap();
 
-        for extra in &self.compressed_chunk_extra {
-            extra.serialize(&mut header).unwrap();
+        if let Some(compressed_chunk_extra) = &self.compressed_chunk_extra {
+            for extra in compressed_chunk_extra {
+                extra.serialize(&mut header).unwrap();
+            }
         }
 
         // aes padding
@@ -791,9 +805,9 @@ fn main() -> AnyResult<()> {
     // let bubbles = Upk::new(fs::File::open("boost_Bubble_SF.upk").unwrap()).unwrap();
     // let bubbles = Upk::new(fs::File::open("boost_Bubble_SF_2.upk").unwrap()).unwrap();
 
-    let upk = Upk::new(fs::File::open("boost_Bubble_SF.upk").unwrap()).unwrap();
+    let upk = Upk::new(fs::File::open("boost_flamethrower_sf.upk").unwrap()).unwrap();
     let serialized = upk.serialize().unwrap();
-    fs::write("boost_Bubble_SF_2.upk", &serialized).unwrap();
+    fs::write("boost_flamethrower_sf_2.upk", &serialized).unwrap();
 
     Ok(())
 }
