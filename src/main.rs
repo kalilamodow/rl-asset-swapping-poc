@@ -689,6 +689,7 @@ impl FHeaderEncryptedRegion {
         new_summary: &mut FPackageFileSummary,
     ) -> Vec<u8> {
         let mut header = Cursor::new(Vec::new());
+        let global_to_local_offset = |offset: i32| offset - summary_padding_size - summary_size;
         let current_global_offset = |header: &mut Cursor<Vec<u8>>| {
             header.stream_position().unwrap() as i32 + summary_size + summary_padding_size
         };
@@ -722,14 +723,52 @@ impl FHeaderEncryptedRegion {
             }
         }
 
+        header.write(&[0u8; 1000]).unwrap(); // yay this can be whatever
+
         // aes padding
-        let cursor_position = header.position();
-        let required_cursor_position = (cursor_position + 15) & !15;
-        for i in 0..(required_cursor_position - cursor_position) {
-            let pos = cursor_position + i;
-            print!("{pos} ");
+        let new_header_size = header.position();
+        let new_header_size_full = (new_header_size + 15) & !15;
+        for i in 0..dbg!(new_header_size_full - new_header_size) {
+            let pos = new_header_size + i;
             let byte = (pos % 0xFF) as u8;
             header.write_u8(byte).unwrap();
+        }
+
+        let header_size_change = new_header_size_full as i32 - self.read_region_size;
+
+        println!("header size changed by {header_size_change}");
+        new_summary.total_header_size += header_size_change;
+
+        let mut new_exports = self.exports.clone();
+        for export in &mut new_exports {
+            export.serial_offset += header_size_change as i64;
+        }
+        header.set_position(global_to_local_offset(new_summary.export_offset) as u64);
+        for export in new_exports {
+            export.serialize(&mut header).unwrap();
+        }
+
+        header.set_position(new_summary.compressed_chunk_info_offset as u64);
+        let mut new_compressed_chunk_info = self.compressed_chunk_info.clone();
+        for chunk in &mut new_compressed_chunk_info.inner {
+            chunk.compressed_offset += header_size_change as i64;
+
+            // idk why but if you do the one with 0 size it freezes the game
+            if chunk.uncompressed_size != 0 {
+                chunk.uncompressed_offset += header_size_change as i64;
+            }
+        }
+        new_compressed_chunk_info.serialize(&mut header).unwrap();
+
+        if let Some(compressed_chunk_extra) = &self.compressed_chunk_extra {
+            let mut new_compressed_chunk_extra = compressed_chunk_extra.clone();
+            for extra in &mut new_compressed_chunk_extra {
+                extra.offset += header_size_change as i64;
+            }
+
+            for extra in new_compressed_chunk_extra {
+                extra.serialize(&mut header).unwrap();
+            }
         }
 
         let mut header = header.into_inner();
@@ -805,9 +844,9 @@ fn main() -> AnyResult<()> {
     // let bubbles = Upk::new(fs::File::open("boost_Bubble_SF.upk").unwrap()).unwrap();
     // let bubbles = Upk::new(fs::File::open("boost_Bubble_SF_2.upk").unwrap()).unwrap();
 
-    let upk = Upk::new(fs::File::open("boost_flamethrower_sf.upk").unwrap()).unwrap();
+    let upk = Upk::new(fs::File::open("boost_bubble_sf.upk").unwrap()).unwrap();
     let serialized = upk.serialize().unwrap();
-    fs::write("boost_flamethrower_sf_2.upk", &serialized).unwrap();
+    fs::write("boost_bubble_sf_2.upk", &serialized).unwrap();
 
     Ok(())
 }
