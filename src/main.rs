@@ -617,8 +617,6 @@ impl FHeaderEncryptedRegion {
 
         println!("decrypted!");
         let mut tables_reader = Cursor::new(tables_data);
-        // after this point, the summary offsets are wrong because the reader's ZERO is
-        // actually summary.name_offset. so, we have to subtract summary.name_offset for stuff
 
         let mut names = Vec::with_capacity(summary.name_count as usize);
         for _ in 0..summary.name_count {
@@ -736,9 +734,10 @@ impl FHeaderEncryptedRegion {
 
         let header_size_change = new_header_size_full as i32 - self.read_region_size;
 
-        println!("header size changed by {header_size_change}");
-        new_summary.total_header_size += header_size_change;
+        new_summary.total_header_size =
+            new_header_size as i32 + new_summary.garbage_size + new_summary.name_offset;
 
+        println!("header size changed by {header_size_change}");
         let mut new_exports = self.exports.clone();
         for export in &mut new_exports {
             export.serial_offset += header_size_change as i64;
