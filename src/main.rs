@@ -686,6 +686,7 @@ impl FHeaderEncryptedRegion {
         summary_padding_size: i32,
         new_summary: &mut FPackageFileSummary,
     ) -> Vec<u8> {
+        println!();
         let mut header = Cursor::new(Vec::new());
         let current_global_offset = |header: &mut Cursor<Vec<u8>>| {
             header.stream_position().unwrap() as i32 + summary_size + summary_padding_size
@@ -693,8 +694,16 @@ impl FHeaderEncryptedRegion {
 
         new_summary.name_offset = current_global_offset(&mut header);
         let mut new_names = self.names.clone();
-        new_names[0].name.inner = "abab".into();
         for name in &mut new_names {
+            // 5 characters shorter, so insert 5 nuls
+            if &name.name.inner == "Boost_AlphaReward" {
+                name.name.inner = "Boost_Bubble\0\0\0\0\0".to_string();
+            } else if &name.name.inner == "Boost_AlphaReward_SF" {
+                name.name.inner = "Boost_Bubble_SF\0\0\0\0\0".to_string();
+            } else if name.name.inner.to_lowercase().contains("alpha") {
+                dbg!(&name);
+            }
+
             name.serialize(&mut header).unwrap();
         }
 
@@ -730,6 +739,11 @@ impl FHeaderEncryptedRegion {
             let byte = (pos % 0xFF) as u8;
             header.write_u8(byte).unwrap();
         }
+
+        println!(
+            "encrypted region size change: {}",
+            new_header_size_full as i32 - self.read_region_size
+        );
 
         let mut header = header.into_inner();
         fs::write("decrypted_tables_my_own.bin", &header).unwrap();
@@ -801,11 +815,13 @@ impl Upk {
 }
 
 fn main() -> AnyResult<()> {
-    let upk = Upk::new(fs::File::open("boost_Bubble_SF.upk").unwrap()).unwrap();
+    let mut donor = Upk::new(fs::File::open("Boost_AlphaReward_SF.upk").unwrap()).unwrap();
+    let target = Upk::new(fs::File::open("boost_Bubble_SF.upk").unwrap()).unwrap();
 
-    let serialized = upk.serialize().unwrap();
-    fs::write("boost_Bubble_SF_2.upk", &serialized).unwrap();
-    // Upk::new(fs::File::open("boost_Bubble_SF_2.upk").unwrap()).unwrap();
+    donor.summary.guid = target.summary.guid;
+
+    let serialized = donor.serialize().unwrap();
+    fs::write("boost_Bubble_SF_faked.upk", &serialized).unwrap();
 
     Ok(())
 }
