@@ -590,6 +590,29 @@ impl UPKPart for FExportEntry {
 }
 
 #[derive(Debug, Clone)]
+struct NameSwap {
+    from: String,
+    to: String,
+}
+
+impl NameSwap {
+    fn new(from: String, to: String) -> Self {
+        Self { from, to }
+    }
+
+    /// returns the padded version if paddable, otherwise None
+    fn padded(&self) -> Option<String> {
+        let amount_to_pad = self.from.len().checked_sub(self.to.len());
+        let Some(amount_to_pad) = amount_to_pad else {
+            return None;
+        };
+
+        let padding = "\0".repeat(amount_to_pad);
+        Some(format!("{}{padding}", self.to))
+    }
+}
+
+#[derive(Debug, Clone)]
 struct FHeaderEncryptedRegion {
     names: Vec<FNameEntry>,
     imports: Vec<FImportEntry>,
@@ -597,6 +620,8 @@ struct FHeaderEncryptedRegion {
     compressed_chunk_info: TArray<FCompressedChunkInfo>,
     compressed_chunk_extra: Option<Vec<FCompressedChunkAdditionalInfo>>,
     read_region_size: i32,
+
+    name_swaps: Vec<NameSwap>,
 }
 
 impl FHeaderEncryptedRegion {
@@ -604,6 +629,11 @@ impl FHeaderEncryptedRegion {
         let actual_encrypted_size =
             summary.total_header_size - summary.garbage_size - summary.name_offset;
         let encrypted_size = (actual_encrypted_size + 15) & !15; // roudns up to nearest aes block
+        dbg!(
+            summary.total_header_size,
+            actual_encrypted_size,
+            encrypted_size
+        );
 
         global_reader
             .seek(SeekFrom::Start(summary.name_offset as u64))
@@ -670,6 +700,11 @@ impl FHeaderEncryptedRegion {
             tables_reader.stream_position().unwrap()
         );
 
+        println!(
+            "DIFFERENCE BETWEEN END OF EXTRA AND ACTUAL_ENCRYPTED_SIZE={}",
+            tables_reader.position() as i32 - actual_encrypted_size
+        );
+
         Self {
             names,
             imports,
@@ -677,6 +712,7 @@ impl FHeaderEncryptedRegion {
             compressed_chunk_info,
             compressed_chunk_extra,
             read_region_size: encrypted_size,
+            name_swaps: Vec::new(),
         }
     }
 
@@ -694,18 +730,23 @@ impl FHeaderEncryptedRegion {
 
         new_summary.name_offset = current_global_offset(&mut header);
         let mut new_names = self.names.clone();
+        let mut name_size_increase = 0;
         for name in &mut new_names {
-            // 5 characters shorter, so insert 5 nuls
-            if &name.name.inner == "Boost_AlphaReward" {
-                name.name.inner = "Boost_Bubble\0\0\0\0\0".to_string();
-            } else if &name.name.inner == "Boost_AlphaReward_SF" {
-                name.name.inner = "Boost_Bubble_SF\0\0\0\0\0".to_string();
-            } else if name.name.inner.to_lowercase().contains("alpha") {
-                dbg!(&name);
+            for swap in &self.name_swaps {
+                if name.name.inner == swap.from {
+                    if let Some(padded) = swap.padded() {
+                        name.name.inner = padded;
+                    } else {
+                        name_size_increase += swap.to.len() - name.name.inner.len();
+                        name.name.inner = swap.to.clone();
+                    }
+                }
             }
 
             name.serialize(&mut header).unwrap();
         }
+
+        dbg!(name_size_increase);
 
         new_summary.import_offset = current_global_offset(&mut header);
         for import in &self.imports {
@@ -740,6 +781,10 @@ impl FHeaderEncryptedRegion {
             header.write_u8(byte).unwrap();
         }
 
+        new_summary.total_header_size =
+            new_header_size as i32 + new_summary.name_offset + new_summary.garbage_size;
+        dbg!(new_summary.total_header_size);
+
         println!(
             "encrypted region size change: {}",
             new_header_size_full as i32 - self.read_region_size
@@ -750,6 +795,10 @@ impl FHeaderEncryptedRegion {
         encrypt(&mut header);
         fs::write("encrypted_tables_my_own.bin", &header).unwrap();
         header
+    }
+
+    pub fn add_name_swap(&mut self, swap: NameSwap) {
+        self.name_swaps.push(swap);
     }
 }
 
@@ -763,13 +812,17 @@ struct Upk {
 impl Upk {
     fn new(mut reader: impl Read + Seek) -> AnyResult<Self> {
         let summary = FPackageFileSummary::deserialize(&mut reader).unwrap();
-        println!("{summary:#?}");
         if summary.tag == PACKAGE_FILE_TAG {
             println!("package tag is correct :)");
         } else {
             println!("package tag is incorrect :( (got {})", summary.tag);
             return Err("Package tag is incorrect".into());
         }
+        println!(
+            "deserialized summary. position: {}. name offset: {}",
+            reader.stream_position().unwrap(),
+            summary.name_offset
+        );
 
         let decrypted = FHeaderEncryptedRegion::extract(&summary, &mut reader);
 
@@ -815,13 +868,21 @@ impl Upk {
 }
 
 fn main() -> AnyResult<()> {
-    let mut donor = Upk::new(fs::File::open("Boost_AlphaReward_SF.upk").unwrap()).unwrap();
-    let target = Upk::new(fs::File::open("boost_Bubble_SF.upk").unwrap()).unwrap();
+    let mut donor = Upk::new(fs::File::open("boost_Bubble_SF.upk").unwrap()).unwrap();
+    let target = Upk::new(fs::File::open("Boost_Standard_SF.upk").unwrap()).unwrap();
 
     donor.summary.guid = target.summary.guid;
+    donor.decrypted.add_name_swap(NameSwap::new(
+        "Boost_Bubble".into(),
+        "Boost_Standard".into(),
+    ));
+    donor.decrypted.add_name_swap(NameSwap::new(
+        "Boost_Bubble_SF".into(),
+        "Boost_Standard_SF".into(),
+    ));
 
     let serialized = donor.serialize().unwrap();
-    fs::write("boost_Bubble_SF_faked.upk", &serialized).unwrap();
+    fs::write("Boost_Standard_SF_faked.upk", &serialized).unwrap();
 
     Ok(())
 }
