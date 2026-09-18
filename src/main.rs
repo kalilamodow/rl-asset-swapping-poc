@@ -629,11 +629,6 @@ impl FHeaderEncryptedRegion {
         let actual_encrypted_size =
             summary.total_header_size - summary.garbage_size - summary.name_offset;
         let encrypted_size = (actual_encrypted_size + 15) & !15; // roudns up to nearest aes block
-        dbg!(
-            summary.total_header_size,
-            actual_encrypted_size,
-            encrypted_size
-        );
 
         global_reader
             .seek(SeekFrom::Start(summary.name_offset as u64))
@@ -666,44 +661,16 @@ impl FHeaderEncryptedRegion {
             exports.push(entry);
         }
 
-        println!(
-            "finished exports. current position: {}",
-            tables_reader.stream_position().unwrap()
-        );
-        println!(
-            "compressed chunk info position: {}",
-            summary.compressed_chunk_info_offset
-        );
         let compressed_chunk_info = TArray::deserialize(&mut tables_reader).unwrap();
-        println!(
-            "finished compressed info. current position: {}",
-            tables_reader.stream_position().unwrap()
-        );
-        println!(
-            "qty compressed chunks: {}",
-            compressed_chunk_info.inner.len()
-        );
         let compressed_chunk_extra = (summary.licensee_version > 32).then(|| {
             let mut compressed_chunk_extra = Vec::with_capacity(compressed_chunk_info.inner.len());
             for _ in 0..compressed_chunk_info.inner.len() {
                 let info = FCompressedChunkAdditionalInfo::deserialize(&mut tables_reader).unwrap();
                 compressed_chunk_extra.push(info);
             }
-            println!(
-                "compressed chunks: {:?}\nextra: {:?}",
-                compressed_chunk_info, compressed_chunk_extra
-            );
+
             compressed_chunk_extra
         });
-        println!(
-            "finished compressed chunk extra. current position: {}",
-            tables_reader.stream_position().unwrap()
-        );
-
-        println!(
-            "DIFFERENCE BETWEEN END OF EXTRA AND ACTUAL_ENCRYPTED_SIZE={}",
-            tables_reader.position() as i32 - actual_encrypted_size
-        );
 
         Self {
             names,
@@ -722,7 +689,7 @@ impl FHeaderEncryptedRegion {
         summary_padding_size: i32,
         new_summary: &mut FPackageFileSummary,
     ) -> Vec<u8> {
-        println!();
+        println!("reserializing encrypted region...");
         let mut header = Cursor::new(Vec::new());
         let current_global_offset = |header: &mut Cursor<Vec<u8>>| {
             header.stream_position().unwrap() as i32 + summary_size + summary_padding_size
@@ -730,23 +697,15 @@ impl FHeaderEncryptedRegion {
 
         new_summary.name_offset = current_global_offset(&mut header);
         let mut new_names = self.names.clone();
-        let mut name_size_increase = 0;
         for name in &mut new_names {
             for swap in &self.name_swaps {
                 if name.name.inner == swap.from {
-                    if let Some(padded) = swap.padded() {
-                        name.name.inner = padded;
-                    } else {
-                        name_size_increase += swap.to.len() - name.name.inner.len();
-                        name.name.inner = swap.to.clone();
-                    }
+                    name.name.inner = swap.padded().unwrap_or_else(|| swap.to.clone());
                 }
             }
 
             name.serialize(&mut header).unwrap();
         }
-
-        dbg!(name_size_increase);
 
         new_summary.import_offset = current_global_offset(&mut header);
         for import in &self.imports {
@@ -758,10 +717,6 @@ impl FHeaderEncryptedRegion {
             export.serialize(&mut header).unwrap();
         }
 
-        println!(
-            "serialized exports. stream position: {}",
-            header.stream_position().unwrap()
-        );
         new_summary.compressed_chunk_info_offset = header.stream_position().unwrap() as i32;
         new_summary.depends_offset = current_global_offset(&mut header);
         self.compressed_chunk_info.serialize(&mut header).unwrap();
@@ -775,7 +730,7 @@ impl FHeaderEncryptedRegion {
         // aes padding
         let new_header_size = header.position();
         let new_header_size_full = (new_header_size + 15) & !15;
-        for i in 0..dbg!(new_header_size_full - new_header_size) {
+        for i in 0..new_header_size_full - new_header_size {
             let pos = new_header_size + i;
             let byte = (pos % 0xFF) as u8;
             header.write_u8(byte).unwrap();
@@ -783,12 +738,6 @@ impl FHeaderEncryptedRegion {
 
         new_summary.total_header_size =
             new_header_size as i32 + new_summary.name_offset + new_summary.garbage_size;
-        dbg!(new_summary.total_header_size);
-
-        println!(
-            "encrypted region size change: {}",
-            new_header_size_full as i32 - self.read_region_size
-        );
 
         let mut header = header.into_inner();
         fs::write("decrypted_tables_my_own.bin", &header).unwrap();
@@ -818,11 +767,6 @@ impl Upk {
             println!("package tag is incorrect :( (got {})", summary.tag);
             return Err("Package tag is incorrect".into());
         }
-        println!(
-            "deserialized summary. position: {}. name offset: {}",
-            reader.stream_position().unwrap(),
-            summary.name_offset
-        );
 
         let decrypted = FHeaderEncryptedRegion::extract(&summary, &mut reader);
 
@@ -862,6 +806,8 @@ impl Upk {
         fs::write("summary_my_own.bin", &serialized).unwrap();
         serialized.write(&encrypted_header).unwrap();
         serialized.write(&self.compressed_data).unwrap();
+
+        println!("reserialized!");
 
         Ok(serialized)
     }
