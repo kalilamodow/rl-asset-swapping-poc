@@ -13,3 +13,6 @@ confirmed to work:
 - a lot of bodies (hitbox swap works)
     - fennec in for octane
     - dominus in for octane
+- a lot of goal explosions
+    - beach party for Default
+    - NOT carbonator (i need more aes keys)
