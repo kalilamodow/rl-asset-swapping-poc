@@ -814,20 +814,29 @@ impl Upk {
 }
 
 fn main() -> AnyResult<()> {
-    let mut donor = Upk::new(fs::File::open("Body_MuscleCar_SF.upk").unwrap()).unwrap();
-    let target = Upk::new(fs::File::open("Body_Octane_SF.upk").unwrap()).unwrap();
+    let i_do_not_own_this_name = std::env::args()
+        .nth(1)
+        .expect("argument 1: the name you DONT own");
+    let i_do_own_this_name = std::env::args()
+        .nth(2)
+        .expect("argument 2: the name you DO own (will be what to equip)");
+
+    let mut donor =
+        Upk::new(fs::File::open(format!("{i_do_not_own_this_name}_SF.upk")).unwrap()).unwrap();
+    let target = Upk::new(fs::File::open(format!("{i_do_own_this_name}_SF.upk")).unwrap()).unwrap();
 
     donor.summary.guid = target.summary.guid;
-    donor
-        .decrypted
-        .add_name_swap(NameSwap::new("Body_MuscleCar".into(), "Body_Octane".into()));
     donor.decrypted.add_name_swap(NameSwap::new(
-        "Body_MuscleCar_SF".into(),
-        "Body_Octane_SF".into(),
+        i_do_not_own_this_name.clone(),
+        i_do_own_this_name.clone(),
+    ));
+    donor.decrypted.add_name_swap(NameSwap::new(
+        format!("{i_do_not_own_this_name}_SF"),
+        format!("{i_do_own_this_name}_SF"),
     ));
 
     let serialized = donor.serialize().unwrap();
-    fs::write("Body_Octane_SF_faked.upk", &serialized).unwrap();
+    fs::write(format!("{i_do_own_this_name}_SF_faked.upk"), &serialized).unwrap();
 
     Ok(())
 }
