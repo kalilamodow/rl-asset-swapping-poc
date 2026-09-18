@@ -814,21 +814,20 @@ impl Upk {
 }
 
 fn main() -> AnyResult<()> {
-    let mut donor = Upk::new(fs::File::open("boost_Bubble_SF.upk").unwrap()).unwrap();
-    let target = Upk::new(fs::File::open("Boost_Standard_SF.upk").unwrap()).unwrap();
+    let mut donor = Upk::new(fs::File::open("Body_MuscleCar_SF.upk").unwrap()).unwrap();
+    let target = Upk::new(fs::File::open("Body_Octane_SF.upk").unwrap()).unwrap();
 
     donor.summary.guid = target.summary.guid;
+    donor
+        .decrypted
+        .add_name_swap(NameSwap::new("Body_MuscleCar".into(), "Body_Octane".into()));
     donor.decrypted.add_name_swap(NameSwap::new(
-        "Boost_Bubble".into(),
-        "Boost_Standard".into(),
-    ));
-    donor.decrypted.add_name_swap(NameSwap::new(
-        "Boost_Bubble_SF".into(),
-        "Boost_Standard_SF".into(),
+        "Body_MuscleCar_SF".into(),
+        "Body_Octane_SF".into(),
     ));
 
     let serialized = donor.serialize().unwrap();
-    fs::write("Boost_Standard_SF_faked.upk", &serialized).unwrap();
+    fs::write("Body_Octane_SF_faked.upk", &serialized).unwrap();
 
     Ok(())
 }
