@@ -9,4 +9,4 @@ confirmed to work:
 - goal explosions
 - skins
 
-note: you need `keys.txt`, i'm working on figuring out where to source it from
+u can get keys.txt from the rlmm discord
