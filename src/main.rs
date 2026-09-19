@@ -685,7 +685,8 @@ impl FHeaderEncryptedRegion {
 
         // basically the best way to check if the key works is just by trying it and giving up if it fails
         let (mut tables_reader, names, key) =
-            decrypt_and_load_names(summary, encrypted_tables_data).unwrap();
+            decrypt_and_load_names(summary, encrypted_tables_data)
+                .expect("couldn't find an aes key");
         println!("loaded names");
 
         let mut imports = Vec::with_capacity(summary.import_count as usize);
