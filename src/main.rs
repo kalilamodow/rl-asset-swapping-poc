@@ -628,26 +628,20 @@ impl NameSwap {
     }
 }
 
-fn decrypt_and_load_names(
-    summary: &FPackageFileSummary,
-    encrypted_tables_data: Vec<u8>,
-) -> Option<(Cursor<Vec<u8>>, Vec<FNameEntry>, RlAesKey)> {
-    'key_loop: for key in RlAesKey::load_all() {
-        let mut decrypted = encrypted_tables_data.clone();
-        decrypt(&mut decrypted, &key);
+fn find_right_aes_key(encrypted_tables_data: &[u8]) -> Option<RlAesKey> {
+    const CHECK_SIZE: usize = 64;
+    let first_few_blocks: [u8; CHECK_SIZE] =
+        encrypted_tables_data[..CHECK_SIZE].try_into().unwrap();
 
-        let mut reader = Cursor::new(decrypted.clone());
-        let mut names = Vec::with_capacity(summary.name_count as usize);
-        for _ in 0..summary.name_count {
-            let entry = match FNameEntry::deserialize(&mut reader) {
-                Ok(e) => e,
-                Err(_) => continue 'key_loop,
-            };
-            names.push(entry);
+    for key in RlAesKey::load_all() {
+        let mut check = first_few_blocks.clone();
+        decrypt(&mut check, &key);
+        let mut cursor = Cursor::new(&check);
+
+        let worked = FString::deserialize(&mut cursor).is_ok();
+        if worked {
+            return Some(key);
         }
-
-        fs::write("decrypted_tables.bin", &decrypted).unwrap();
-        return Some((reader, names, key));
     }
 
     None
@@ -676,18 +670,20 @@ impl FHeaderEncryptedRegion {
             .seek(SeekFrom::Start(summary.name_offset as u64))
             .unwrap();
 
-        let encrypted_tables_data = {
-            let mut data = vec![0u8; encrypted_size as usize];
-            global_reader.read_exact(&mut data).unwrap();
-            data
-        };
-        fs::write("encrypted_tables.bin", &encrypted_tables_data).unwrap();
+        let mut tables_data = vec![0u8; encrypted_size as usize];
+        global_reader.read_exact(&mut tables_data).unwrap();
+        fs::write("encrypted_tables.bin", &tables_data).unwrap();
 
-        // basically the best way to check if the key works is just by trying it and giving up if it fails
-        let (mut tables_reader, names, key) =
-            decrypt_and_load_names(summary, encrypted_tables_data)
-                .expect("couldn't find an aes key");
-        println!("loaded names");
+        let key = find_right_aes_key(&tables_data).unwrap();
+        decrypt(&mut tables_data, &key);
+        fs::write("decrypted_tables.bin", &tables_data).unwrap();
+        let mut tables_reader = Cursor::new(tables_data);
+
+        let mut names = Vec::with_capacity(summary.name_count as usize);
+        for _ in 0..summary.name_count {
+            let entry = FNameEntry::deserialize(&mut tables_reader).unwrap();
+            names.push(entry);
+        }
 
         let mut imports = Vec::with_capacity(summary.import_count as usize);
         for _ in 0..summary.import_count {
