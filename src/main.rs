@@ -733,6 +733,7 @@ impl FHeaderEncryptedRegion {
     ) -> Vec<u8> {
         println!("reserializing encrypted region...");
         let mut header = Cursor::new(Vec::new());
+        let global_to_local_offset = |offset: i32| offset - summary_padding_size - summary_size;
         let current_global_offset = |header: &mut Cursor<Vec<u8>>| {
             header.stream_position().unwrap() as i32 + summary_size + summary_padding_size
         };
@@ -780,6 +781,40 @@ impl FHeaderEncryptedRegion {
 
         new_summary.total_header_size =
             new_header_size as i32 + new_summary.name_offset + new_summary.garbage_size;
+
+        let header_size_change = new_header_size_full as i32 - self.read_region_size;
+        println!("header size changed by {header_size_change}");
+        let mut new_exports = self.exports.clone();
+        for export in &mut new_exports {
+            export.serial_offset += header_size_change as i64;
+        }
+        header.set_position(global_to_local_offset(new_summary.export_offset) as u64);
+        for export in new_exports {
+            export.serialize(&mut header).unwrap();
+        }
+
+        header.set_position(new_summary.compressed_chunk_info_offset as u64);
+        let mut new_compressed_chunk_info = self.compressed_chunk_info.clone();
+        for chunk in &mut new_compressed_chunk_info.inner {
+            chunk.compressed_offset += header_size_change as i64;
+
+            // idk why but if you do the one with 0 size it freezes the game
+            if chunk.uncompressed_size != 0 {
+                chunk.uncompressed_offset += header_size_change as i64;
+            }
+        }
+        new_compressed_chunk_info.serialize(&mut header).unwrap();
+
+        if let Some(compressed_chunk_extra) = &self.compressed_chunk_extra {
+            let mut new_compressed_chunk_extra = compressed_chunk_extra.clone();
+            for extra in &mut new_compressed_chunk_extra {
+                extra.offset += header_size_change as i64;
+            }
+
+            for extra in new_compressed_chunk_extra {
+                extra.serialize(&mut header).unwrap();
+            }
+        }
 
         let mut header = header.into_inner();
         fs::write("decrypted_tables_my_own.bin", &header).unwrap();
