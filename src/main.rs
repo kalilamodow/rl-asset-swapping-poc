@@ -1,17 +1,38 @@
 use aes::Aes256;
+use base64::{Engine, engine::general_purpose};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt as _};
 use cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit as _};
 use std::{
     fs,
-    io::{self, Cursor, Read, Seek, SeekFrom, Write},
+    io::{self, BufRead, Cursor, Read, Seek, SeekFrom, Write},
 };
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+#[derive(Debug, Clone)]
+struct RlAesKey([u8; 32]);
+
+impl RlAesKey {
+    fn load_all() -> Vec<RlAesKey> {
+        let reader = io::BufReader::new(fs::File::open("keys.txt").unwrap());
+        let lines: Vec<_> = reader
+            .lines()
+            .flatten()
+            .filter(|line| line.len() > 4)
+            .collect();
+        let keys: Vec<RlAesKey> = lines
+            .into_iter()
+            .map(|b64line| general_purpose::STANDARD.decode(b64line).unwrap())
+            .map(|decoded| RlAesKey(decoded.try_into().unwrap()))
+            .collect();
+        keys
+    }
+}
+
 trait ReadBytes: Read {
     fn read_bytes(&mut self, n_bytes: usize) -> io::Result<Vec<u8>> {
         let mut buffer = vec![0u8; n_bytes];
-        self.read_exact(&mut buffer).unwrap();
+        self.read_exact(&mut buffer)?;
         Ok(buffer)
     }
 
@@ -90,26 +111,26 @@ impl UPKPart for FString {
     }
 
     fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
-        let length = reader.read_i32::<LittleEndian>().unwrap();
+        let length = reader.read_i32::<LittleEndian>()?;
         let is_unicode = length < 0;
 
         let decoded = if is_unicode {
             let n_words = -length as usize;
 
-            let mut raw = Cursor::new(reader.read_words(n_words).unwrap());
+            let mut raw = Cursor::new(reader.read_words(n_words)?);
             let mut utf16s = Vec::with_capacity(n_words);
             // - 1 for null terminator
             for _ in 0..(n_words - 1) {
-                let word = raw.read_u16::<LittleEndian>().unwrap();
+                let word = raw.read_u16::<LittleEndian>()?;
                 utf16s.push(word);
             }
 
-            String::from_utf16(&utf16s).unwrap()
+            String::from_utf16(&utf16s)?
         } else {
             let n_letters = length as usize;
-            let mut raw = reader.read_bytes(n_letters).unwrap();
+            let mut raw = reader.read_bytes(n_letters)?;
             raw.pop(); // null terminator
-            String::from_utf8(raw).unwrap()
+            String::from_utf8(raw)?
         };
 
         Ok(Self {
@@ -431,28 +452,23 @@ impl UPKPart for FPackageFileSummary {
     }
 }
 
-const AES_KEY: [u8; 32] = [
-    0xC7, 0xDF, 0x6B, 0x13, 0x25, 0x2A, 0xCC, 0x71, 0x47, 0xBB, 0x51, 0xC9, 0x8A, 0xD7, 0xE3, 0x4B,
-    0x7F, 0xE5, 0x00, 0xB7, 0x7F, 0xA5, 0xFA, 0xB2, 0x93, 0xE2, 0xF2, 0x4E, 0x6B, 0x17, 0xE7, 0x79,
-];
-
-fn encrypt(buffer: &mut [u8]) {
+fn encrypt(buffer: &mut [u8], key: &RlAesKey) {
     if buffer.len() % 16 != 0 {
         panic!("encryption: buffer size isnt divisible by 16!");
     }
 
-    let cipher = Aes256::new((&AES_KEY).into());
+    let cipher = Aes256::new((&key.0).into());
     for chunk in buffer.chunks_exact_mut(16) {
         cipher.encrypt_block(chunk.try_into().unwrap());
     }
 }
 
-fn decrypt(buffer: &mut [u8]) {
+fn decrypt(buffer: &mut [u8], key: &RlAesKey) {
     if buffer.len() % 16 != 0 {
         panic!("decryption: buffer size isnt divisible by 16!");
     }
 
-    let cipher = Aes256::new((&AES_KEY).into());
+    let cipher = Aes256::new((&key.0).into());
     for chunk in buffer.chunks_exact_mut(16) {
         cipher.decrypt_block(chunk.try_into().unwrap());
     }
@@ -525,8 +541,8 @@ impl UPKPart for FNameEntry {
 
     fn deserialize(reader: &mut impl Read) -> AnyResult<Self> {
         Ok(Self {
-            name: FString::deserialize(reader).unwrap(),
-            flags: reader.read_u64::<LittleEndian>().unwrap(),
+            name: FString::deserialize(reader)?,
+            flags: reader.read_u64::<LittleEndian>()?,
         })
     }
 }
@@ -612,6 +628,31 @@ impl NameSwap {
     }
 }
 
+fn decrypt_and_load_names(
+    summary: &FPackageFileSummary,
+    encrypted_tables_data: Vec<u8>,
+) -> Option<(Cursor<Vec<u8>>, Vec<FNameEntry>, RlAesKey)> {
+    'key_loop: for key in RlAesKey::load_all() {
+        let mut decrypted = encrypted_tables_data.clone();
+        decrypt(&mut decrypted, &key);
+
+        let mut reader = Cursor::new(decrypted.clone());
+        let mut names = Vec::with_capacity(summary.name_count as usize);
+        for _ in 0..summary.name_count {
+            let entry = match FNameEntry::deserialize(&mut reader) {
+                Ok(e) => e,
+                Err(_) => continue 'key_loop,
+            };
+            names.push(entry);
+        }
+
+        fs::write("decrypted_tables.bin", &decrypted).unwrap();
+        return Some((reader, names, key));
+    }
+
+    None
+}
+
 #[derive(Debug, Clone)]
 struct FHeaderEncryptedRegion {
     names: Vec<FNameEntry>,
@@ -620,6 +661,7 @@ struct FHeaderEncryptedRegion {
     compressed_chunk_info: TArray<FCompressedChunkInfo>,
     compressed_chunk_extra: Option<Vec<FCompressedChunkAdditionalInfo>>,
     read_region_size: i32,
+    key: RlAesKey,
 
     name_swaps: Vec<NameSwap>,
 }
@@ -634,20 +676,17 @@ impl FHeaderEncryptedRegion {
             .seek(SeekFrom::Start(summary.name_offset as u64))
             .unwrap();
 
-        let mut tables_data = vec![0u8; encrypted_size as usize];
-        global_reader.read_exact(&mut tables_data).unwrap();
-        fs::write("encrypted_tables.bin", &tables_data).unwrap();
-        decrypt(&mut tables_data);
-        fs::write("decrypted_tables.bin", &tables_data).unwrap();
+        let encrypted_tables_data = {
+            let mut data = vec![0u8; encrypted_size as usize];
+            global_reader.read_exact(&mut data).unwrap();
+            data
+        };
+        fs::write("encrypted_tables.bin", &encrypted_tables_data).unwrap();
 
-        println!("decrypted!");
-        let mut tables_reader = Cursor::new(tables_data);
-
-        let mut names = Vec::with_capacity(summary.name_count as usize);
-        for _ in 0..summary.name_count {
-            let entry = FNameEntry::deserialize(&mut tables_reader).unwrap();
-            names.push(entry);
-        }
+        // basically the best way to check if the key works is just by trying it and giving up if it fails
+        let (mut tables_reader, names, key) =
+            decrypt_and_load_names(summary, encrypted_tables_data).unwrap();
+        println!("loaded names");
 
         let mut imports = Vec::with_capacity(summary.import_count as usize);
         for _ in 0..summary.import_count {
@@ -673,6 +712,7 @@ impl FHeaderEncryptedRegion {
         });
 
         Self {
+            key,
             names,
             imports,
             exports,
@@ -688,6 +728,7 @@ impl FHeaderEncryptedRegion {
         summary_size: i32,
         summary_padding_size: i32,
         new_summary: &mut FPackageFileSummary,
+        key: Option<&RlAesKey>,
     ) -> Vec<u8> {
         println!("reserializing encrypted region...");
         let mut header = Cursor::new(Vec::new());
@@ -741,7 +782,7 @@ impl FHeaderEncryptedRegion {
 
         let mut header = header.into_inner();
         fs::write("decrypted_tables_my_own.bin", &header).unwrap();
-        encrypt(&mut header);
+        encrypt(&mut header, key.unwrap_or(&self.key));
         fs::write("encrypted_tables_my_own.bin", &header).unwrap();
         header
     }
@@ -785,7 +826,7 @@ impl Upk {
         })
     }
 
-    fn serialize(&self) -> AnyResult<Vec<u8>> {
+    fn serialize(&self, key: Option<&RlAesKey>) -> AnyResult<Vec<u8>> {
         let summary_size = {
             let mut serialized_summary = Vec::new();
             self.summary.serialize(&mut serialized_summary).unwrap();
@@ -798,6 +839,7 @@ impl Upk {
             summary_size as i32,
             summary_padding_size,
             &mut modified_summary,
+            key,
         );
 
         let mut serialized = Vec::new();
@@ -835,7 +877,7 @@ fn main() -> AnyResult<()> {
         format!("{i_do_own_this_name}_SF"),
     ));
 
-    let serialized = donor.serialize().unwrap();
+    let serialized = donor.serialize(Some(&target.decrypted.key)).unwrap();
     fs::write(format!("{i_do_own_this_name}_SF_faked.upk"), &serialized).unwrap();
 
     Ok(())
