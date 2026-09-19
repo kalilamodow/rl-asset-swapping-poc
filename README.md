@@ -16,3 +16,5 @@ confirmed to work:
 - a lot of goal explosions
     - beach party for Default
     - NOT carbonator (i need more aes keys)
+- a lot of skins
+    - hyper huntress for Dominus: Stripes
