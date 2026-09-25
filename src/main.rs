@@ -12,7 +12,6 @@ use std::{
     fmt::Debug,
     fs,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
-    ops::Deref,
     path::{Path, PathBuf},
 };
 
@@ -652,38 +651,10 @@ impl FHeaderEncryptedRegion {
     }
 }
 
-enum PayloadType {
-    Compressed(Vec<u8>),
-    CompressedAndEncrypted(Vec<u8>),
-}
-
-impl Debug for PayloadType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::Compressed(_) => "PayloadType::Compressed",
-                Self::CompressedAndEncrypted(_) => "PayloadType::CompressedAndEncrypted",
-            }
-        )
-    }
-}
-
-impl Deref for PayloadType {
-    type Target = Vec<u8>;
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Compressed(c) => &c,
-            Self::CompressedAndEncrypted(c) => &c,
-        }
-    }
-}
-
 pub struct Upk<'a> {
     summary: FPackageFileSummary,
     header: FHeaderEncryptedRegion,
-    payload: PayloadType,
+    payload: Vec<u8>,
     key: &'a RlAesKey,
     id: &'a ItemPackageName,
 }
@@ -708,15 +679,11 @@ impl<'a> Upk<'a> {
         reader.read_to_end(&mut payload)?;
 
         Ok(Self {
+            summary,
             header,
-            payload: if summary.extra_encryption() {
-                PayloadType::CompressedAndEncrypted(payload)
-            } else {
-                PayloadType::Compressed(payload)
-            },
+            payload,
             key,
             id,
-            summary,
         })
     }
 
@@ -754,6 +721,10 @@ impl<'a> Upk<'a> {
     }
 
     pub fn pretend_to_be(&mut self, other: &'a Upk) {
+        if self.summary.extra_encryption() && !other.summary.extra_encryption() {
+            self.ctr_payload();
+        }
+
         self.header.add_swap(NameSwap {
             from: self.id.id().to_owned(),
             to: other.id.id().to_owned(),
@@ -766,12 +737,24 @@ impl<'a> Upk<'a> {
         self.key = other.key;
         self.id = other.id;
     }
+
+    fn ctr_payload(&mut self) {
+        let global_to_local_pos = |position: i32| {
+            position - (self.summary.name_offset + self.summary.encrypted_region_size())
+        };
+
+        for chunk in &self.header.compressed_chunk_info.inner {
+            let start = global_to_local_pos(chunk.compressed_offset as i32) as usize;
+            let end = start + chunk.compressed_size as usize;
+            self.key
+                .ctr(&mut self.payload[start..end], chunk.nonce.as_ref().unwrap());
+        }
+    }
 }
 
 fn main() {
     let package = ItemPackageName("boost_alphadevreward".into());
     let key = RlAesKey::from_base64("YXMmjoZ7OIqAP9md3ZXbOb3wf6fG2YT39W3J0bAuYOY=").unwrap();
     let upk = Upk::open(Path::new("boost_alphadevreward_SF.upk"), &package, &key).unwrap();
-    dbg!(upk.payload);
     dbg!(upk.summary.extra_encryption());
 }
