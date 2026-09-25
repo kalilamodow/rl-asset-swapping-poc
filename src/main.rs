@@ -9,8 +9,10 @@ use anyhow::{Context as _, Result, ensure};
 use base64::{Engine, engine::general_purpose};
 use byteorder::{LittleEndian, ReadBytesExt as _, WriteBytesExt as _};
 use std::{
+    fmt::Debug,
     fs,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
+    ops::Deref,
     path::{Path, PathBuf},
 };
 
@@ -650,10 +652,38 @@ impl FHeaderEncryptedRegion {
     }
 }
 
+enum PayloadType {
+    Compressed(Vec<u8>),
+    CompressedAndEncrypted(Vec<u8>),
+}
+
+impl Debug for PayloadType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Compressed(_) => "PayloadType::Compressed",
+                Self::CompressedAndEncrypted(_) => "PayloadType::CompressedAndEncrypted",
+            }
+        )
+    }
+}
+
+impl Deref for PayloadType {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Compressed(c) => &c,
+            Self::CompressedAndEncrypted(c) => &c,
+        }
+    }
+}
+
 pub struct Upk<'a> {
     summary: FPackageFileSummary,
     header: FHeaderEncryptedRegion,
-    payload: Vec<u8>, // the compressed info
+    payload: PayloadType,
     key: &'a RlAesKey,
     id: &'a ItemPackageName,
 }
@@ -678,11 +708,15 @@ impl<'a> Upk<'a> {
         reader.read_to_end(&mut payload)?;
 
         Ok(Self {
-            summary,
             header,
-            payload,
+            payload: if summary.extra_encryption() {
+                PayloadType::CompressedAndEncrypted(payload)
+            } else {
+                PayloadType::Compressed(payload)
+            },
             key,
             id,
+            summary,
         })
     }
 
@@ -705,7 +739,7 @@ impl<'a> Upk<'a> {
             .serialize(&mut serialized, false)
             .context("Upk: serializing modified summary")?;
         serialized.extend(&encrypted_header);
-        serialized.extend(&self.payload);
+        serialized.extend_from_slice(&self.payload);
 
         Ok(serialized)
     }
@@ -735,9 +769,9 @@ impl<'a> Upk<'a> {
 }
 
 fn main() {
-    let package = ItemPackageName("wheel_pixie_b".into());
-    let key = RlAesKey::from_base64("qrwNX0NTpZFaZCfUOL7g2eFWRwdeeseUOooe3GpFc8Y=").unwrap();
-    let upk = Upk::open(Path::new("wheel_pixie_b_SF.upk"), &package, &key).unwrap();
-    dbg!(upk.summary.licensee_version);
+    let package = ItemPackageName("boost_alphadevreward".into());
+    let key = RlAesKey::from_base64("YXMmjoZ7OIqAP9md3ZXbOb3wf6fG2YT39W3J0bAuYOY=").unwrap();
+    let upk = Upk::open(Path::new("boost_alphadevreward_SF.upk"), &package, &key).unwrap();
+    dbg!(upk.payload);
     dbg!(upk.summary.extra_encryption());
 }
