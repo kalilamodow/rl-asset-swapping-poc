@@ -735,8 +735,9 @@ impl<'a> Upk<'a> {
 }
 
 fn main() {
-    let package = ItemPackageName("boost_alphadevreward".into());
-    let key = RlAesKey::from_base64("YXMmjoZ7OIqAP9md3ZXbOb3wf6fG2YT39W3J0bAuYOY=").unwrap();
-    let upk = Upk::open(Path::new("boost_alphadevreward_SF.upk"), &package, &key).unwrap();
-    fs::write("boost_alphareward_SF_2.upk", upk.serialize().unwrap()).unwrap();
+    let package = ItemPackageName("wheel_pixie_b".into());
+    let key = RlAesKey::from_base64("qrwNX0NTpZFaZCfUOL7g2eFWRwdeeseUOooe3GpFc8Y=").unwrap();
+    let upk = Upk::open(Path::new("wheel_pixie_b_SF.upk"), &package, &key).unwrap();
+    dbg!(upk.summary.licensee_version);
+    dbg!(upk.summary.extra_encryption());
 }
