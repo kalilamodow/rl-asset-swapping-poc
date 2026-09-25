@@ -465,6 +465,10 @@ impl NameSwap {
     }
 }
 
+fn dumpbin(name: &str, bytes: &[u8]) {
+    fs::write(format!("{}.bin", name.replace(" ", "_")), bytes).unwrap()
+}
+
 const NONCE_SIZE: i32 = 12;
 
 #[derive(Debug, Clone)]
@@ -501,6 +505,7 @@ impl FHeaderEncryptedRegion {
         } else {
             key.decrypt(&mut tables_data);
         }
+        dumpbin("decrypted tables", &tables_data);
 
         let mut tables_reader = Cursor::new(tables_data);
         let v33 = summary.v33();
@@ -580,13 +585,21 @@ impl FHeaderEncryptedRegion {
             .serialize(&mut header, v33)
             .context("FHeaderEncryptedRegion: serializing compressed chunk info")?;
 
-        // aes padding
         let new_header_size = header.position();
         let new_header_size_full = (new_header_size + 15) & !15;
-        for i in 0..new_header_size_full - new_header_size {
-            let pos = new_header_size + i;
-            let byte = (pos % 0xFF) as u8;
-            header.write_u8(byte).unwrap();
+        {
+            let aes_padding_size = new_header_size_full - new_header_size;
+            if new_summary.extra_encryption() {
+                // boring padding
+                header.write(&vec![0u8; aes_padding_size as usize]).unwrap();
+            } else {
+                // cool padding
+                for i in 0..new_header_size_full - new_header_size {
+                    let pos = new_header_size + i;
+                    let byte = (pos % 0xFF) as u8;
+                    header.write_u8(byte).unwrap();
+                }
+            }
         }
 
         let header_size_change = new_header_size_full as i32 - new_summary.encrypted_region_size();
@@ -619,6 +632,7 @@ impl FHeaderEncryptedRegion {
             .unwrap();
 
         let mut encrypted = header.into_inner();
+        dumpbin("my decrypted tables", &encrypted);
         if new_summary.extra_encryption() {
             key.ctr(&mut encrypted, &self.nonce);
         } else {
@@ -721,10 +735,8 @@ impl<'a> Upk<'a> {
 }
 
 fn main() {
-    Upk::open(
-        Path::new("boost_alphadevreward_SF.upk"),
-        &ItemPackageName("boost_alphadevreward".into()),
-        &RlAesKey::from_base64("YXMmjoZ7OIqAP9md3ZXbOb3wf6fG2YT39W3J0bAuYOY=").unwrap(),
-    )
-    .unwrap();
+    let package = ItemPackageName("boost_alphadevreward".into());
+    let key = RlAesKey::from_base64("YXMmjoZ7OIqAP9md3ZXbOb3wf6fG2YT39W3J0bAuYOY=").unwrap();
+    let upk = Upk::open(Path::new("boost_alphadevreward_SF.upk"), &package, &key).unwrap();
+    fs::write("boost_alphareward_SF_2.upk", upk.serialize().unwrap()).unwrap();
 }
